@@ -140,6 +140,99 @@ class TestStatusEventsResume:
         assert rc == 1
 
 
+class TestCrashRecoveryCli:
+    def test_kill9_supervisor_then_restart_adopts_orphan(self, tmp_repo):
+        """端到端 M5 验收：kill -9 Supervisor → 重启 → 收养还活着的 Parent，
+        绝不启动第二个 Agent；孤儿退出后从 state 继续直至完成。"""
+        write_repo_toml(tmp_repo, default_config(), fake_dsh=True)
+        layout = Layout(tmp_repo)
+
+        hang_env = dict(
+            os.environ,
+            FAKE_DSH_MODE="hang",
+            FAKE_DSH_STATE=running_state_json(),
+        )
+        proc1 = subprocess.Popen(
+            [sys.executable, "-m", "supervisor", "run", str(tmp_repo)],
+            cwd=str(PROJECT_DIR),
+            env=hang_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            # 1. 等第一个 Parent 启动并记录 pid
+            deadline = time.monotonic() + 15
+            parent_pid = None
+            while time.monotonic() < deadline:
+                rt = RuntimeStore(layout).load()
+                if rt is not None and rt.current_parent and rt.current_parent.pid:
+                    parent_pid = rt.current_parent.pid
+                    break
+                time.sleep(0.05)
+            assert parent_pid is not None, "supervisor never started a parent"
+            assert os.path.exists(f"/proc/{parent_pid}")
+
+            # 2. kill -9 Supervisor（模拟崩溃），Parent 继续存活
+            proc1.kill()
+            proc1.wait()
+            rt = RuntimeStore(layout).load()
+            assert rt is not None and rt.current_parent and rt.current_parent.pid == parent_pid
+
+            # 3. 重启 Supervisor —— 必须收养孤儿
+            exit_env = dict(
+                os.environ,
+                FAKE_DSH_MODE="exit0",
+                FAKE_DSH_STATE=completed_state_json(),
+            )
+            proc2 = subprocess.Popen(
+                [sys.executable, "-m", "supervisor", "run", str(tmp_repo)],
+                cwd=str(PROJECT_DIR),
+                env=exit_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                deadline = time.monotonic() + 15
+                adopted = False
+                while time.monotonic() < deadline:
+                    evs = EventLog(layout.events_path).read_all()
+                    adopted = any(e["event"] == "ORPHAN_ADOPTED" for e in evs)
+                    if adopted:
+                        break
+                    time.sleep(0.05)
+                assert adopted, "restarted supervisor did not adopt the orphan"
+
+                # 收养期间绝不允许启动第二个 Parent
+                starts = EventLog(layout.events_path).events_named("PARENT_STARTED")
+                assert len(starts) == 1
+
+                # 4. 杀掉孤儿 → Supervisor 察觉并继续
+                os.killpg(parent_pid, signal.SIGKILL)
+                rc = proc2.wait(timeout=20)
+                assert rc == 0
+                rt = RuntimeStore(layout).load()
+                assert rt.status == SupervisorStatus.STOPPED_SUCCESS
+                assert rt.stop_reason == StopReason.TASK_COMPLETED
+                assert (
+                    len(EventLog(layout.events_path).events_named("PARENT_STARTED")) == 2
+                )
+                starts[0]["activation"]  # 第一次是 activation 1
+            finally:
+                if proc2.poll() is None:
+                    proc2.kill()
+                    proc2.wait()
+        finally:
+            if proc1.poll() is None:
+                proc1.kill()
+                proc1.wait()
+            # 清理孤儿（若仍在）
+            try:
+                if os.path.exists(f"/proc/{parent_pid}"):
+                    os.killpg(parent_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, NameError):
+                pass
+
+
 class TestStopCli:
     def test_stop_signals_running_supervisor(self, tmp_repo):
         """端到端：SIGTERM 停止 Supervisor，Parent 进程组必须被清。"""
