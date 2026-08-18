@@ -42,6 +42,7 @@ class DshRunner:
         activation_id: int,
         timeout_seconds: int,
         run_dir,
+        on_start=None,
     ) -> ParentResult:
         repo = Path(repo)
         run_dir = Path(run_dir)
@@ -82,6 +83,8 @@ class DshRunner:
 
         pid = proc.pid
         process_start_id = read_start_id(pid)
+        if on_start is not None:
+            on_start(pid, process_start_id)
 
         timed_out = False
         try:
@@ -89,6 +92,10 @@ class DshRunner:
         except asyncio.TimeoutError:
             timed_out = True
             await self._terminate_group(proc)
+        except asyncio.CancelledError:
+            # operator stop 到来：与超时相同的清场流程，再向外传播取消
+            await self._terminate_group(proc)
+            raise
 
         ended_at = _now_iso()
         duration = __import__("time").monotonic() - start_mono
