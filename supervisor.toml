@@ -1,0 +1,33 @@
+# supervisor.toml — Autonomous Development Supervisor configuration (V1)
+# See docs/supervisor-protocol.md for the full protocol.
+
+version = 1
+
+[dsh]
+executable = "dsh"
+profile = "headless"
+
+[limits]
+max_parent_activations = 20
+max_crash_restarts = 5
+max_clean_restarts = 10
+max_timeouts = 3
+max_ci_wakeups = 10
+
+parent_timeout_seconds = 2700
+terminate_grace_seconds = 10
+
+max_active_wall_seconds = 14400
+
+[restart]
+backoff_seconds = [2, 5, 15, 30, 60]
+
+[ci]
+enabled = false
+provider = "github"
+poll_seconds = 30
+discovery_grace_seconds = 180
+max_wait_seconds = 7200
+
+[human]
+pause_active_wall_clock = true

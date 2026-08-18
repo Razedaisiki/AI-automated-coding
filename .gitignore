@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Supervisor runtime artifacts (owned by Supervisor, never committed)
+.supervisor/
+
+# Agent protocol state (written by Parent at runtime)
+.agent/state.json
+.agent/state.json.tmp
+.agent/state.json.tmp.*
+
+# Nested target repos used as fixtures
+hello_world/
+
+# Editors / OS
+*.swp
+.DS_Store

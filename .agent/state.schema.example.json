@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "task_id": "TASK-001",
+
+  "status": "RUNNING",
+
+  "checkpoint_seq": 7,
+
+  "checkpoint": {
+    "phase": "implementation",
+    "summary": "Implementing refresh token rotation"
+  },
+
+  "git": {
+    "branch": "feat/refresh-token",
+    "head": "abc1234",
+    "pushed_head": null
+  },
+
+  "ci": {
+    "sha": null,
+    "status": "NONE"
+  },
+
+  "next_action": "Continue implementation",
+
+  "blocker": null,
+
+  "updated_at": "2026-08-18T06:00:00Z"
+}
