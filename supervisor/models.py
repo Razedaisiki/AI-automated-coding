@@ -315,6 +315,8 @@ class ParentResult:
     stderr_path: str
     run_dir: str
     reason: str = ""
+    pid: Optional[int] = None
+    process_start_id: Optional[str] = None
 
 
 @dataclass
