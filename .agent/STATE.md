@@ -2,40 +2,30 @@
 
 ## 阶段
 
-FINALIZE（实现完成，交付审查完成，生成交付报告）
+M5 hardening 完成，准备交付验证
 
 ## 完成情况
 
-- M0–M5 全部完成并提交（5 个 milestone commit）。
-- 测试：71 passed（M1:25, M2:7, M3-M5 engine:21, CLI:12, git probe:3, adversarial:3）。
-  覆盖文档五十一 的 01–09、15–24 场景（10-14 的 CI 细节属 M7 范围）。
-- 端到端验证：
-  - `kill -9 Supervisor → 重启 → 收养孤儿 → 孤儿退出后继续至完成`（test_cli 端到端）。
-  - 外部 SIGKILL 正在运行的 Parent 进程组 → 检测为 PARENT_CRASH + crash_restarts≥1 + 进程组清干净。
-  - `supervisor stop` 发 SIGTERM → STOPPED_OPERATOR 且 Parent 进程组被清。
-  - 第二个 `supervisor run` 被锁拒绝 rc=2。
-  - 真实子进程超时 → SIGTERM→SIGKILL 进程组（engine+DshRunner+fake dsh）。
-  - 进入 WAIT_HUMAN 前的活跃时长计入墙钟预算。
+- hardening 7 项全部完成并自测通过。
+- 新增 tests/test_hardening.py 7 项：收养+stop 杀孤儿、STARTING 记录 reconcile/重 spawn、事件时序、收养期超时限额、stop 身份校验（错身份/缺失身份 均拒绝）。
+- 既有 71 项全绿，合计 **78 passed**。
+- 全量 `python -m pytest -q` → 78 passed（~12s）。
+- 静态检查：无 `shell=True`、`py_compile` 全过。
+- 文件名：`AGENT.md → AGENTS.md`，`storage.agent_plan_path` 已改 `.agent/PLAN.md`，prompts 统一读取清单。
 
 ## 验证记录
 
-- `python3 -m pytest` → 71 passed（11.45s）
-- `python3 -m supervisor --help` → 正常
-- `python3 -m supervisor run <repo-without-toml>` → rc=1, "error: config file not found: ..."（无 traceback）
-- 静态检查：无 shell=True、无 os.system/eval；py_compile 全过
-- Python 3.8.10 兼容（无 3.10+ 语法；tomllib→tomli 回退）
+- launcher: `sys.path` 修正 `parent.parent`（此前 `ModuleNotFoundError: supervisor` 导致 M2 失败）。
+- `is_proc_alive` 增加僵尸（Z）判定；`terminate_process_group` 轮询式 grace。
+- runtime 在 `_restore_or_init_runtime` 同步最新 `config.limits`（修复收养期超时限额不生效）。
+- DshRunner 经 launcher；缺失可执行文件时通过 127 + stderr 标记抛 `RunnerError`（保持既有测试语义）。
+- 协议文档 13 章重写，补充 process.json / 身份双重校验 / 三态恢复 / 事件拆分。
 
 ## 阻塞项
 
-无
+无（后续 M6/M7 属计划外）。
 
 ## 分支 / 提交
 
-- master：3aabeef（M0+M1）、ecafa95（M2）、44cbf55（M3–M5）、7527a90（kill-9 e2e + 文档）、b360dac（审查补充测试）
-
-## 环境备注
-
-- `/` 只读：`~/.dsh` 不可写，真实 `dsh --profile headless` 在当前环境无法启动
-  （EROFS）。DSH 可执行文件路径与 profile 均可配置，测试全部用 fake dsh 脚本；
-  接入真实 headless 时需把 DSH_HOME 指向可写位置并为 headless profile 配置插件
-  （文档五十四）。
+- master: 3aabeef (M0+M1), ecafa95 (M2), 44cbf55 (M3–M5), 7527a90, b360dac, 5f116b4
+- 待提交 hardening: launcher + engine + models + cli + 协议 + hardening 测试

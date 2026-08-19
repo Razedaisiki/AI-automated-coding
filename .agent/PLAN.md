@@ -1,35 +1,34 @@
-# .agent/PLAN.md — Autonomous Development Supervisor (M0–M5)
+# .agent/PLAN.md — M5 hardening（按评审意见）
 
-## 任务目标
+## 目标
 
-按 `AI_automated_coding.md` 实施 Supervisor（确定性进程管理器），完成 M0–M5：
-
-> Supervisor 决定 WHEN；Parent Agent 决定 HOW。
-
-## 验收标准
-
-- 保存状态、事件、锁全部原子/只追加；并发第二个 Supervisor 被锁拒绝。
-- DshRunner 能启动 `dsh --profile headless`（可配置 executable，测试用 fake dsh），
-  超时先 SIGTERM 进程组、宽限期后 SIGKILL。
-- 本地循环：无状态→INITIAL_START；RUNNING→继续；COMPLETED→成功停止；
-  BLOCKED→阻塞停止；exit0+RUNNING→下一轮；exit!=0+RUNNING→崩溃重启。
-- 限额：max activations / crash / clean / timeouts / active wall time → STOPPED_LIMIT。
-- 崩溃恢复：kill -9 Supervisor 后重启，收养存活孤儿，绝不启动第二个 Parent。
+按评审“P0/P1 收养与崩溃窗口”完成 hardening：收养孤儿期 `stop` 必须杀整个进程组；
+`STARTING_PARENT` 崩溃窗口用 `launcher+process.json` 消除重复 Parent；
+收养期 timeout/wall-time 继续生效；`supervisor stop` 增加 Supervisor 身份校验；
+文件名统一；`cmdline` 校验接入恢复；`PARENT_STARTING`/`PARENT_STARTED` 拆分；
+5 个回归测试 + 71 个原有测试全绿。
 
 ## 任务清单
 
-| ID | 描述 | 状态 |
+| ID | 任务 | 状态 |
 |---|---|---|
-| M0 | 冻结协议：docs/supervisor-protocol.md、supervisor.toml、state schema 示例 | DONE |
-| M1 | config / models / storage / events / lock | DONE |
-| M2 | DshRunner（进程组/超时/SIGTERM→SIGKILL）+ parent-once | DONE |
-| M3 | 本地 Supervisor 主循环（RUNNING/COMPLETED/BLOCKED + 重启策略） | DONE |
-| M4 | 限额/退避/超时/墙钟预算 → STOPPED_LIMIT | DONE |
-| M5 | 崩溃恢复：runtime 恢复、进程身份、orphan 收养、operator SIGTERM | DONE |
-| 测试 | 68 tests green（FakeParentRunner + fake dsh，零 LLM） | DONE |
-| 文档 | 更新 STATE.md / FINAL_REPORT.md | IN_PROGRESS |
+| H1 | launcher 自写 process.json + DshRunner exec 链改造 | DONE |
+| H2 | models: ParentInfo.token / RuntimeState.supervisor_process_start_id | DONE |
+| H3 | engine: 三态恢复（NO/STARTING/RUNNING）+ record reconciliation + adoption 限额/超时 | DONE |
+| H4 | process_identity: is_dsh_process / is_proc_alive(僵尸判定) / storage/plan 命名统一 | DONE |
+| H5 | events: PARENT_STARTING/KILLED/RECONCILED/SPAWN_UNCONFIRMED/RECORD_STALE | DONE |
+| H6 | cli: stop 身份校验（pid+start_id），init/status/events 不变 | DONE |
+| H7 | prompts/AGENTS.md/.agent/PLAN.md 统一，协议文档 13 章重写 | DONE |
+| H8 | tests/test_hardening.py 7 项 + 既有 71 项 全绿 | DONE |
 
-## 后续（本轮不做，文档明确属于后续里程碑）
+## 验收（可命令验证）
 
-M7 CI 轮询（GitHub provider，先 fake）、M8 人工评审接入 GitHub、V2 token/cost 计量、
-多任务调度。`[ci] enabled = false` 保持默认。
+- `python -m pytest -q` → 78 passed
+- `supervisor run` 收养期 `stop` → 进程组必死、PARENT_KILLED、STOPPED_OPERATOR
+- `STARTING_PARENT` + 有 record → 收养（无重复启动）；无 record → PARENT_SPAWN_UNCONFIRMED 后重 spawn
+- 收养期 parent timeout / wall-time → 杀进程组、计数、STOPPED_LIMIT
+- `supervisor stop` 对错误/缺失身份的 PID → 拒绝（rc=1，不动目标进程）
+
+## 出域
+
+不做 M6/M7/M8（CI 轮询、GitHub review、token/cost），不引入第三方依赖。

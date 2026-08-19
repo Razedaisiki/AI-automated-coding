@@ -1,11 +1,7 @@
-"""Parent Prompt 构建（M2）。
+"""Parent Prompt 构建（M2+M5 hardening）。
 
-Supervisor 只发送控制协议，不含开发逻辑（怎么 test/review/修代码由
-AGENTS.md 决定）。只设置 durable boundary 的契约。
-
-事件：INITIAL_START / CONTINUE / RECOVER_AFTER_PARENT_CRASH /
-      RECOVER_AFTER_PARENT_TIMEOUT / CI_FAILED / CI_SUCCEEDED /
-      HUMAN_APPROVED / HUMAN_CHANGES_REQUESTED
+Supervisor 只发送控制协议，不含开发逻辑。统一文件名：
+TASK.md / AGENTS.md / .agent/PLAN.md / .agent/STATE.md / .agent/state.json
 """
 
 _INITIAL = (
@@ -17,7 +13,8 @@ _INITIAL = (
     "Read:\n"
     "- TASK.md\n"
     "- AGENTS.md\n"
-    "- .agent/plan.md if it exists\n"
+    "- .agent/PLAN.md if it exists\n"
+    "- .agent/STATE.md if it exists\n"
     "- .agent/state.json if it exists\n"
     "\n"
     "Inspect the actual repository state.\n"
@@ -49,9 +46,9 @@ _CONTINUE = (
     "The previous Parent activation ended normally but the task is not yet in "
     "a stable terminal state.\n"
     "\n"
-    "Read TASK.md, AGENTS.md, .agent/plan.md and .agent/state.json, inspect "
-    "the actual repository state, then continue the existing task "
-    "autonomously.\n"
+    "Read TASK.md, AGENTS.md, .agent/PLAN.md, .agent/STATE.md and "
+    ".agent/state.json, inspect the actual repository state, then continue "
+    "the existing task autonomously.\n"
     "\n"
     "Before ending, atomically checkpoint .agent/state.json with a strictly "
     "incremented checkpoint_seq."
@@ -64,7 +61,8 @@ _RECOVER_CRASH = (
     "\n"
     "Do not restart the development task from scratch.\n"
     "\n"
-    "Read TASK.md, AGENTS.md, .agent/plan.md and .agent/state.json.\n"
+    "Read TASK.md, AGENTS.md, .agent/PLAN.md, .agent/STATE.md and "
+    ".agent/state.json.\n"
     "Inspect the actual repository state, including: current branch, HEAD, "
     "git status, working-tree changes, existing commits.\n"
     "Persisted agent state may lag behind the repository because the previous "
@@ -85,7 +83,7 @@ _RECOVER_TIMEOUT = (
     ".agent/state.json.\n"
     "\n"
     "Inspect the actual repository state, reconcile it with .agent/state.json "
-    "and .agent/plan.md, then continue the existing task autonomously. Before "
+    "and .agent/STATE.md, then continue the existing task autonomously. Before "
     "ending, atomically checkpoint .agent/state.json."
 )
 

@@ -80,7 +80,7 @@ class Layout:
 
     @property
     def agent_plan_path(self) -> Path:
-        return self.base / ".agent" / "plan.md"
+        return self.base / ".agent" / "PLAN.md"
 
     # Supervisor 世界（只写）
     @property

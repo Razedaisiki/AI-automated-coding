@@ -128,7 +128,7 @@ class FakeParentRunner:
         tmp.write_text(json.dumps(state.to_dict()), encoding="utf-8")
         tmp.replace(self.layout.agent_state_path)
 
-    async def run(self, *, repo, prompt, activation_id, timeout_seconds, run_dir, on_start=None):
+    async def run(self, *, repo, prompt, activation_id, timeout_seconds, run_dir, on_start=None, activation_token=None):
         step = self._next()
         run_dir = Path(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)

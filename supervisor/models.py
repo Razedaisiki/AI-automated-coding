@@ -155,6 +155,7 @@ class ParentInfo:
     process_start_id: Optional[str]
     started_at: Optional[str]
     reason: str
+    activation_token: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -163,6 +164,7 @@ class ParentInfo:
             "process_start_id": self.process_start_id,
             "started_at": self.started_at,
             "reason": self.reason,
+            "activation_token": self.activation_token,
         }
 
     @classmethod
@@ -173,6 +175,7 @@ class ParentInfo:
             process_start_id=raw.get("process_start_id"),
             started_at=raw.get("started_at"),
             reason=raw.get("reason", ""),
+            activation_token=raw.get("activation_token"),
         )
 
 
@@ -252,9 +255,10 @@ class RuntimeState:
     counters: Counters
     limits: Limits
     last_agent_checkpoint_seq: int
-    supervisor_pid: Optional[int]
-    active_budget: Optional[Dict[str, Any]]
-    stop_reason: Optional[StopReason]
+    supervisor_pid: Optional[int] = None
+    supervisor_process_start_id: Optional[str] = None
+    active_budget: Optional[Dict[str, Any]] = None
+    stop_reason: Optional[StopReason] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -266,6 +270,7 @@ class RuntimeState:
             "limits": self.limits.to_dict() if self.limits else None,
             "last_agent_checkpoint_seq": self.last_agent_checkpoint_seq,
             "supervisor_pid": self.supervisor_pid,
+            "supervisor_process_start_id": self.supervisor_process_start_id,
             "active_budget": self.active_budget,
             "stop_reason": self.stop_reason.value if self.stop_reason else None,
         }
@@ -292,6 +297,7 @@ class RuntimeState:
             limits=Limits.from_dict(limits_raw) if limits_raw else None,
             last_agent_checkpoint_seq=int(raw.get("last_agent_checkpoint_seq", 0)),
             supervisor_pid=raw.get("supervisor_pid"),
+            supervisor_process_start_id=raw.get("supervisor_process_start_id"),
             active_budget=raw.get("active_budget"),
             stop_reason=StopReason(raw["stop_reason"]) if raw.get("stop_reason") else None,
         )

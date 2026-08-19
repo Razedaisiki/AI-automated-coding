@@ -123,7 +123,7 @@ class TestStatusEventsResume:
         monkeypatch.setenv("FAKE_DSH_STATE", completed_state_json())
         write_repo_toml(tmp_repo, default_config(), fake_dsh=True)
         main(["run", str(tmp_repo)])
-        rc = main(["events", str(tmp_repo), "--tail", "5"])
+        rc = main(["events", str(tmp_repo), "--tail", "10"])
         assert rc == 0
         out = capsys.readouterr().out
         assert "SUPERVISOR_STARTED" in out

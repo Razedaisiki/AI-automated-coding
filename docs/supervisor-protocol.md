@@ -40,8 +40,8 @@ Supervisor 只用只读探测：`rev-parse`、`symbolic-ref`、`status --porcela
 | 文件 | 谁写 | 谁读 | 描述 |
 |---|---|---|---|
 | `.agent/state.json` | **Parent** | Supervisor（只读） | 开发任务做到哪了 |
-| `.agent/plan.md` | Parent | Supervisor 不解析（只传 "read it"） | 开发计划 |
-| `.agent/STATE.md` / `.agent/PLAN.md` | Parent | Parent | Parent 自己的文档工作流 |
+| `.agent/PLAN.md` | Parent | Supervisor 不解析（只传 "read it"） | 开发计划 |
+| `.agent/STATE.md` | Parent | Parent | Parent 自己的文档工作流 |
 | `.supervisor/runtime.json` | **Supervisor** | Supervisor | 自动化系统运行到哪了 |
 | `.supervisor/events.jsonl` | Supervisor | 任何人 | 只追加的事件日志 |
 | `.supervisor/lock` | Supervisor | Supervisor | 独占锁 |
@@ -141,7 +141,8 @@ STOPPED_OPERATOR  操作员停止
     "pid": 412514,
     "process_start_id": "123456",
     "started_at": "2026-08-18T06:02:00Z",
-    "reason": "RECOVER_AFTER_CRASH"
+    "reason": "RECOVER_AFTER_CRASH",
+    "activation_token": "a3b830670d2546cdb7851f4f281ef3aa"
   },
   "counters": {
     "parent_activations": 6,
@@ -153,6 +154,7 @@ STOPPED_OPERATOR  操作员停止
   "limits": { "...": "镜像 supervisor.toml，便于审计" },
   "last_agent_checkpoint_seq": 7,
   "supervisor_pid": 1000,
+  "supervisor_process_start_id": "123457",
   "active_budget": { "accrued_seconds": 0.0, "last_mark": "..." },
   "stop_reason": null
 }
@@ -239,12 +241,14 @@ INVALID_AGENT_STATE | SUPERVISOR_INTERNAL_ERROR | OPERATOR_STOP
 
 ```json
 {"ts":"...","event":"SUPERVISOR_STARTED"}
-{"ts":"...","event":"PARENT_STARTED","activation":1,"pid":1234,"reason":"INITIAL_START"}
+{"ts":"...","event":"PARENT_STARTING","activation":1,"reason":"INITIAL_START","activation_token":"a3b8..."}
+{"ts":"...","event":"PARENT_STARTED","activation":1,"pid":1234,"process_start_id":"123456","reason":"INITIAL_START"}
 {"ts":"...","event":"PARENT_EXITED","activation":1,"exit_code":0,"timed_out":false}
 {"ts":"...","event":"AGENT_STATE","status":"WAIT_CI","checkpoint_seq":4}
 {"ts":"...","event":"PARENT_CLEAN_EXIT_WITH_RUNNING_STATE","activation":1}
 {"ts":"...","event":"PARENT_CRASH","activation":1,"exit_code":1}
 {"ts":"...","event":"PARENT_TIMEOUT","activation":1}
+{"ts":"...","event":"PARENT_KILLED","activation":1,"pid":1234,"reason":"PARENT_TIMEOUT"}
 {"ts":"...","event":"RESTART_BACKOFF","seconds":5,"reason":"RECOVER_AFTER_PARENT_CRASH"}
 {"ts":"...","event":"LIMIT_REACHED","reason":"MAX_CRASH_RESTARTS"}
 {"ts":"...","event":"SUPERVISOR_STOPPED","status":"STOPPED_LIMIT","stop_reason":"MAX_CRASH_RESTARTS"}
@@ -257,7 +261,8 @@ INVALID_AGENT_STATE | SUPERVISOR_INTERNAL_ERROR | OPERATOR_STOP
 ## 11. 运行目录（`.supervisor/runs/activation-NNNNNN/`）
 
 每轮 Parent 一个目录，保存 `prompt.txt`、`stdout.log`、`stderr.log`、
-`result.json`、`git-before.json`、`git-after.json`。`result.json`：
+`process.json`（launcher 自写 pid/start_id/token）、`result.json`、
+`git-before.json`、`git-after.json`。`result.json`：
 
 ```json
 {
@@ -287,19 +292,32 @@ INVALID_AGENT_STATE | SUPERVISOR_INTERNAL_ERROR | OPERATOR_STOP
 
 ---
 
-## 13. 崩溃恢复契约（M5）
+## 13. 崩溃恢复契约（M5 hardening）
 
-Supervisor 重启时：
+Supervisor 重启时三态恢复（`NO_PARENT` / `STARTING_PARENT` / `RUNNING_PARENT`）：
 
 ```
 BOOT → 拿独占锁 → 读 runtime.json → 读 .agent/state.json
-     → 检查 recorded PID：
-         PID 存在 + /proc/<pid>/stat starttime 一致 + cmdline 仍是 DSH
-           → orphan Parent 收养：不启动第二个 Parent，轮询 /proc/<pid> 等其退出
+     → 若状态为 STARTING_PARENT（pid 未知）：
+         读 .supervisor/runs/activation-N/process.json
+         token 一致 + pid 存在 + starttime 一致 + cmdline 仍是 DSH/launcher
+           → 收养孤儿（PARENT_RECONCILED）
+         记录缺失 → 宽限等待；仍无则重新 spawn（PARENT_SPAWN_UNCONFIRMED）
+     → 若状态为 RUNNING_PARENT：
+         PID 存在 + starttime 一致 + cmdline 仍是 DSH/launcher
+           → orphan 收养：不启动第二个 Parent，轮询 /proc 等其退出
+           收养期间：stop 到来→杀进程组；parent timeout / wall-time 继续生效
          PID 不存在 / 身份不一致 → 上一轮进程已死，按状态继续
 ```
 
-PID 复用防线：不能只 `os.kill(pid, 0)`，必须校验进程 start identity。
+防线：
+
+- PID 复用：`pid + starttime + cmdline(contains dsh/launcher)` 三重校验。
+- `supervisor stop`：`supervisor_pid + supervisor_process_start_id` 双重校验。
+- `supervisor/` 启动的真实 DSH 子进程由 `supervisor/launcher.py` 自写 `process.json`
+ （exec 前原子写），消除 `spawn → persist PID` 微窗口的重复 Parent 风险。
+- 事件拆分：`PARENT_STARTING`（意图持久化，含 token）→ `PARENT_STARTED`（确认，
+  含 pid/process_start_id），便于审计与恢复回放。
 
 ---
 
@@ -322,4 +340,4 @@ PID 复用防线：不能只 `os.kill(pid, 0)`，必须校验进程 start identi
 
 > **我可以随时杀掉一个 Parent，甚至杀掉 Supervisor 本身，然后重新启动
 > Supervisor，它仍然能够在不破坏仓库、不启动重复 Agent 的情况下，从
-> `.agent/state.json + .agent/plan.md + Git state` 恢复开发任务。**
+> `.agent/state.json + .agent/PLAN.md + Git state` 恢复开发任务。**

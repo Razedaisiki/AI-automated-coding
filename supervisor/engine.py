@@ -1,17 +1,17 @@
-"""Supervisor 引擎主循环（M3/M4/M5）。
+"""Supervisor 引擎主循环（M3/M4/M5 hardening）。
 
-纪律：
-
-- Supervisor 决定 WHEN：启动/监控/终止 Parent、限额、等待、终止条件。
-- 状态判定永远以 fresh 的 `.agent/state.json` 为准，绝不解析 stdout。
-- 每次循环最先 `enforce_limits()`。
-- 所有 runtime 写入原子化；当前 Parent 的 pid+startid 在 spawn 后立即持久化，
-  以便 Supervisor 自身崩溃后做 orphan 收养。
+- 三态恢复：NO_PARENT / STARTING_PARENT(pid=None + token) / RUNNING_PARENT(pid+start_id)
+- STARTING_PARENT 通过 launcher 自写的 process.json 进行 reconciliation（有界宽限）
+- PARENT_STARTING → PARENT_STARTED 拆分审计
+- 收养期间：stop→杀进程组，parent timeout / wall-time 继续生效，cmdline 校验接入
+- supervisor 自身 PID 身份写入 runtime
 """
 
 import asyncio
 import os
+import signal
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,8 +33,13 @@ from .events import (
     PARENT_CLEAN_EXIT_WITH_RUNNING_STATE,
     PARENT_CRASH,
     PARENT_EXITED,
+    PARENT_KILLED,
     PARENT_NO_PROGRESS,
+    PARENT_RECORD_STALE,
+    PARENT_RECONCILED,
+    PARENT_SPAWN_UNCONFIRMED,
     PARENT_STARTED,
+    PARENT_STARTING,
     PARENT_TIMEOUT,
     RESUME_RECEIVED,
     RESTART_BACKOFF,
@@ -58,8 +63,8 @@ from .models import (
     StopReason,
     SupervisorStatus,
 )
+from .process_identity import identity_matches, is_dsh_process, is_proc_alive, read_start_id
 from .prompts import build_prompt
-from .process_identity import identity_matches, is_proc_alive
 from .storage import Layout, RuntimeStore, atomic_write_json, load_agent_state, read_json_strict
 
 
@@ -69,8 +74,6 @@ def _now_iso() -> str:
 
 @dataclass
 class Outcome:
-    """一次 activation 后的分派结果。"""
-
     action: str  # restart | wait_ci | wait_human | stop_success | stop_blocked | stop_limit
     next_reason: Optional[str] = None
     backoff: bool = False
@@ -95,11 +98,8 @@ class SupervisorEngine:
         self.lock = None
         self.rt: Optional[RuntimeState] = None
 
-    # ------------------------------------------------------------- public
-
     @property
     def stop_event(self):
-        """惰性创建：避免 Python 3.8 下在事件循环外构造 Event 绑定已关闭的 loop。"""
         if self.stop_event_proxy is None:
             self.stop_event_proxy = asyncio.Event()
             if self._stop_requested:
@@ -107,7 +107,6 @@ class SupervisorEngine:
         return self.stop_event_proxy
 
     def request_stop(self) -> None:
-        """操作员停止（SIGINT/SIGTERM 由 CLI 接到后调用）。"""
         self._stop_requested = True
         if self.stop_event_proxy is not None:
             self.stop_event_proxy.set()
@@ -123,7 +122,6 @@ class SupervisorEngine:
         self.log.emit(LOCK_ACQUIRED)
 
         self.rt = self._restore_or_init_runtime()
-        # 启动时与现有 agent 状态同步 checkpoint 水位（避免把旧 checkpoint 当本轮新产出）
         existing_agent = self._read_agent_state_safe()
         if existing_agent is not None:
             self.rt.last_agent_checkpoint_seq = max(
@@ -140,7 +138,6 @@ class SupervisorEngine:
                     return self._finalize(
                         StopReason.OPERATOR_STOP, SupervisorStatus.STOPPED_OPERATOR, 0
                     )
-
                 self._accrue_budget()
                 limit = self._enforce_limits()
                 if limit is not None:
@@ -182,7 +179,6 @@ class SupervisorEngine:
                     await self._wait_ci(agent)
                     continue
 
-                # RUNNING → 跑一轮
                 reason = next_reason or "CONTINUE"
                 next_reason = None
                 outcome = await self._activation_cycle(reason)
@@ -201,15 +197,9 @@ class SupervisorEngine:
             if self.lock is not None:
                 self.lock.release()
 
-    # ------------------------------------------------------------ helpers
-
     async def _process_outcome(self, outcome: Optional[Outcome]):
-        """分派一次 activation 的结果。
-
-        返回 ("stop", reason, status, rc) / next_reason / None（继续循环）。
-        """
         if outcome is None:
-            return None  # 运行中被 operator stop
+            return None
         if outcome.action == "stop_success":
             return ("stop", StopReason.TASK_COMPLETED, SupervisorStatus.STOPPED_SUCCESS, 0)
         if outcome.action == "stop_blocked":
@@ -220,7 +210,7 @@ class SupervisorEngine:
             await self._wait_ci(outcome.agent)
             return None
         if outcome.action == "wait_human":
-            return None  # 主循环从 state 重新分派
+            return None
         if outcome.action == "restart":
             if outcome.backoff:
                 await self._backoff(outcome.next_reason)
@@ -244,10 +234,9 @@ class SupervisorEngine:
         )
         return rc
 
-    # -------------------------------------------------------- runtime I/O
-
     def _restore_or_init_runtime(self) -> RuntimeState:
         existing = self.store.load()
+        sid = read_start_id(os.getpid())
         if existing is None:
             rt = RuntimeState(
                 schema_version=1,
@@ -267,12 +256,12 @@ class SupervisorEngine:
                 ),
                 last_agent_checkpoint_seq=0,
                 supervisor_pid=os.getpid(),
+                supervisor_process_start_id=sid,
                 active_budget={"accrued_seconds": 0.0, "last_mark": None},
                 stop_reason=None,
             )
             self._save_runtime(rt)
             return rt
-
         self.log.emit(
             SUPERVISOR_CRASH_RECOVERY,
             previous_status=existing.status.value,
@@ -285,9 +274,21 @@ class SupervisorEngine:
         )
         existing.status = SupervisorStatus.BOOTING
         existing.supervisor_pid = os.getpid()
+        existing.supervisor_process_start_id = sid
         existing.stop_reason = None
         if not existing.active_budget:
             existing.active_budget = {"accrued_seconds": 0.0, "last_mark": None}
+        # 同步最新的配置限额（测试与真实场景中配置可能在重启间变化）
+        existing.limits = Limits(
+            max_parent_activations=self.config.limits.max_parent_activations,
+            max_crash_restarts=self.config.limits.max_crash_restarts,
+            max_clean_restarts=self.config.limits.max_clean_restarts,
+            max_timeouts=self.config.limits.max_timeouts,
+            max_ci_wakeups=self.config.limits.max_ci_wakeups,
+            max_active_wall_seconds=self.config.limits.max_active_wall_seconds,
+            parent_timeout_seconds=self.config.limits.parent_timeout_seconds,
+            terminate_grace_seconds=self.config.limits.terminate_grace_seconds,
+        )
         self._save_runtime(existing)
         return existing
 
@@ -295,7 +296,6 @@ class SupervisorEngine:
         self.store.save(rt if rt is not None else self.rt)
 
     def _read_agent_state(self) -> Optional[AgentState]:
-        """读取+校验 .agent/state.json；非法抛 AgentStateError。"""
         state = load_agent_state(self.layout.agent_state_path)
         if state is not None:
             self.log.emit(
@@ -308,8 +308,6 @@ class SupervisorEngine:
             return load_agent_state(self.layout.agent_state_path)
         except AgentStateError:
             return None
-
-    # ------------------------------------------------------- limits/backoff
 
     def _enforce_limits(self) -> Optional[StopReason]:
         c = self.rt.counters
@@ -328,7 +326,6 @@ class SupervisorEngine:
         return None
 
     def _accrue_budget(self) -> None:
-        """活跃墙钟结算。WAIT_HUMAN 且 pause_active_wall_clock 时暂停。"""
         budget = self.rt.active_budget or {"accrued_seconds": 0.0, "last_mark": None}
         paused = (
             self.rt.status == SupervisorStatus.WAITING_HUMAN
@@ -353,14 +350,11 @@ class SupervisorEngine:
         self.rt.status = SupervisorStatus.RESTART_BACKOFF
         self._save_runtime()
         self.log.emit(RESTART_BACKOFF, seconds=delay, reason=reason)
-        # 可中断的分片睡眠（operator stop 立即生效）
         steps = max(1, int(delay * 10))
         for _ in range(steps):
             if self.stop_event.is_set():
                 return
             await asyncio.sleep(delay / steps)
-
-    # ----------------------------------------------------------- wait gates
 
     async def _wait_ci(self, agent: AgentState) -> None:
         self.rt.status = SupervisorStatus.WAITING_CI
@@ -368,7 +362,6 @@ class SupervisorEngine:
         sha = agent.ci.get("sha") if isinstance(agent.ci, dict) else None
         if not self.config.ci.enabled:
             self.log.emit(CI_DISABLED, requested_sha=sha)
-            # M7 前的安全占位：轮询状态文件变化 / 操作员停止，绝不启动第二个 Parent
             while not self.stop_event.is_set():
                 st = self._read_agent_state_safe()
                 if st is None or st.status != agent.status:
@@ -378,9 +371,8 @@ class SupervisorEngine:
         raise NotImplementedError("CI provider polling (M7) is not implemented yet")
 
     async def _wait_human(self) -> Optional[str]:
-        """WAITING_HUMAN：等待 `supervisor resume --event ...` 或 operator stop。"""
         self.rt.status = SupervisorStatus.WAITING_HUMAN
-        self._accrue_budget()  # 结算后暂停预算（mark=None）
+        self._accrue_budget()
         self._save_runtime()
         self.log.emit(WAIT_HUMAN)
         while not self.stop_event.is_set():
@@ -395,46 +387,156 @@ class SupervisorEngine:
                     if event in ("HUMAN_APPROVED", "HUMAN_CHANGES_REQUESTED"):
                         resume.unlink()
                         self.rt.status = SupervisorStatus.BOOTING
-                        self._accrue_budget()  # 恢复预算（mark=now）
+                        self._accrue_budget()
                         self._save_runtime()
                         self.log.emit(RESUME_RECEIVED, resume_event=event)
                         return event
             await asyncio.sleep(0.2)
         return None
 
-    async def _adopt_orphan_if_needed(self) -> None:
-        """Supervisor 重启后：记录的 Parent 还活着（pid+starttime 一致）→ 收养。
+    def _load_process_record(self, activation_id: int):
+        p = self.layout.run_dir(activation_id) / "process.json"
+        try:
+            return read_json_strict(p)
+        except (ValueError, OSError):
+            return None
 
-        收养期间轮询 /proc 等其退出，绝不启动第二个 Parent。
-        """
+    def _adoption_deadline(self, parent: ParentInfo):
+        timeout = self.config.limits.parent_timeout_seconds
+        try:
+            ts = datetime.fromisoformat(parent.started_at.replace("Z", "+00:00")).timestamp()
+            return ts + timeout
+        except Exception:
+            return time.time() + timeout
+
+    async def _adopt_orphan_if_needed(self) -> None:
         parent = self.rt.current_parent
-        if parent is None or not parent.pid:
+        if parent is None:
             return
         pid = parent.pid
         sid = parent.process_start_id
-        if is_proc_alive(pid) and identity_matches(pid, sid):
-            self.log.emit(ORPHAN_ADOPTED, activation=parent.activation_id, pid=pid)
-            while not self.stop_event.is_set():
-                if not (is_proc_alive(pid) and identity_matches(pid, sid)):
-                    break
-                await asyncio.sleep(0.2)
+        token = parent.activation_token
+
+        # STARTING_PARENT：spawn 结果未知 → 通过 process.json reconciliation
+        if pid is None:
+            record = self._load_process_record(parent.activation_id)
+            if record is not None and record.get("activation_token") == token:
+                rpid = record.get("pid")
+                rsid = record.get("process_start_id")
+                if (
+                    rpid
+                    and rsid
+                    and is_proc_alive(rpid)
+                    and identity_matches(rpid, rsid)
+                    and is_dsh_process(rpid)
+                ):
+                    pid, sid = rpid, rsid
+                    parent.pid = pid
+                    parent.process_start_id = sid
+                    self.rt.status = SupervisorStatus.RUNNING_PARENT
+                    self.log.emit(PARENT_RECONCILED, activation=parent.activation_id, pid=pid)
+                    self._save_runtime()
+                else:
+                    self.log.emit(PARENT_RECORD_STALE, activation=parent.activation_id)
+                    self.rt.current_parent = None
+                    self._save_runtime()
+                    return
+            else:
+                grace = max(0.5, self.config.limits.terminate_grace_seconds)
+                deadline = time.monotonic() + grace
+                reconciled = False
+                while time.monotonic() < deadline and not self.stop_event.is_set():
+                    record = self._load_process_record(parent.activation_id)
+                    if record is not None and record.get("activation_token") == token:
+                        rpid = record.get("pid")
+                        rsid = record.get("process_start_id")
+                        if (
+                            rpid
+                            and rsid
+                            and is_proc_alive(rpid)
+                            and identity_matches(rpid, rsid)
+                            and is_dsh_process(rpid)
+                        ):
+                            pid, sid = rpid, rsid
+                            parent.pid = pid
+                            parent.process_start_id = sid
+                            self.rt.status = SupervisorStatus.RUNNING_PARENT
+                            self.log.emit(PARENT_RECONCILED, activation=parent.activation_id, pid=pid)
+                            self._save_runtime()
+                            reconciled = True
+                            break
+                    await asyncio.sleep(0.05)
+                if not reconciled:
+                    self.log.emit(
+                        PARENT_SPAWN_UNCONFIRMED,
+                        activation=parent.activation_id,
+                        activation_token=token,
+                    )
+                    self.rt.current_parent = None
+                    self._save_runtime()
+                    return
+            # 已确认的孤儿，落入下方收养循环
+        # RUNNING_PARENT 完整判定（含 cmdline）
+        if not (is_proc_alive(pid) and identity_matches(pid, sid) and is_dsh_process(pid)):
+            self.rt.counters.parent_activations = max(
+                self.rt.counters.parent_activations, parent.activation_id
+            )
+            self.rt.current_parent = None
+            self._save_runtime()
+            return
+
+        self.log.emit(ORPHAN_ADOPTED, activation=parent.activation_id, pid=pid)
+        deadline = self._adoption_deadline(parent)
+        killed_by = None
+        while True:
+            alive = is_proc_alive(pid) and identity_matches(pid, sid) and is_dsh_process(pid)
+            if not alive:
+                break
+            if self.stop_event.is_set():
+                from .dsh_runner import terminate_process_group
+
+                await terminate_process_group(pid, self.config.limits.terminate_grace_seconds)
+                killed_by = StopReason.OPERATOR_STOP
+                break
+            self._accrue_budget()
+            if (self.rt.active_budget or {}).get("accrued_seconds", 0.0) >= self.config.limits.max_active_wall_seconds:
+                from .dsh_runner import terminate_process_group
+
+                await terminate_process_group(pid, self.config.limits.terminate_grace_seconds)
+                killed_by = StopReason.MAX_ACTIVE_WALL_TIME
+                break
+            if time.time() >= deadline:
+                from .dsh_runner import terminate_process_group
+
+                await terminate_process_group(pid, self.config.limits.terminate_grace_seconds)
+                killed_by = StopReason.MAX_TIMEOUTS
+                break
+            await asyncio.sleep(0.2)
+
+        if killed_by == StopReason.OPERATOR_STOP:
+            self.log.emit(PARENT_KILLED, activation=parent.activation_id, pid=pid, reason="OPERATOR_STOP")
+        elif killed_by == StopReason.MAX_TIMEOUTS:
+            self.rt.counters.timeouts += 1
+            self.log.emit(PARENT_TIMEOUT, activation=parent.activation_id, pid=pid)
+            self.log.emit(PARENT_KILLED, activation=parent.activation_id, pid=pid, reason="PARENT_TIMEOUT")
+        elif killed_by == StopReason.MAX_ACTIVE_WALL_TIME:
+            self.log.emit(PARENT_KILLED, activation=parent.activation_id, pid=pid, reason="MAX_ACTIVE_WALL_TIME")
+        else:
             self.log.emit(ORPHAN_EXITED, pid=pid, activation=parent.activation_id)
-        # 无论死活，激活号不得回退：下一个 activation 从这两者的大值 +1 起算
+
         self.rt.counters.parent_activations = max(
             self.rt.counters.parent_activations, parent.activation_id
         )
         self.rt.current_parent = None
         self._save_runtime()
 
-    # ------------------------------------------------------ parent lifecycle
-
     async def _activation_cycle(self, reason: str) -> Optional[Outcome]:
-        """启动一轮 Parent 并分类结果。被 operator stop 时返回 None。"""
         limit = self._enforce_limits()
         if limit is not None:
             return Outcome(action="stop_limit", limit_reason=limit)
 
         activation_id = self.rt.counters.parent_activations + 1
+        token = uuid.uuid4().hex
         run_dir = self.layout.run_dir(activation_id)
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -452,16 +554,23 @@ class SupervisorEngine:
             process_start_id=None,
             started_at=_now_iso(),
             reason=reason,
+            activation_token=token,
         )
         self._save_runtime()
-        self.log.emit(PARENT_STARTED, activation=activation_id, reason=reason)
+        self.log.emit(PARENT_STARTING, activation=activation_id, reason=reason, activation_token=token)
 
         def on_start(pid, start_id):
-            # spawn 后立即持久化进程身份，供 Supervisor 崩溃恢复
             self.rt.current_parent.pid = pid
             self.rt.current_parent.process_start_id = start_id
             self.rt.status = SupervisorStatus.RUNNING_PARENT
             self._save_runtime()
+            self.log.emit(
+                PARENT_STARTED,
+                activation=activation_id,
+                pid=pid,
+                process_start_id=start_id,
+                reason=reason,
+            )
 
         run_task = asyncio.ensure_future(
             self.runner.run(
@@ -471,6 +580,7 @@ class SupervisorEngine:
                 timeout_seconds=self.config.limits.parent_timeout_seconds,
                 run_dir=run_dir,
                 on_start=on_start,
+                activation_token=token,
             )
         )
         stop_task = asyncio.ensure_future(self.stop_event.wait())
@@ -479,7 +589,6 @@ class SupervisorEngine:
             {run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
         )
         if run_task not in done:
-            # operator stop：取消 runner（DshRunner 会清进程组）
             stop_task.cancel()
             run_task.cancel()
             try:
@@ -493,7 +602,7 @@ class SupervisorEngine:
         try:
             result = run_task.result()
             run_error = None
-        except Exception as exc:  # RunnerError 等
+        except Exception as exc:
             result = None
             run_error = exc
 
@@ -501,7 +610,7 @@ class SupervisorEngine:
         self.rt.counters.parent_activations = activation_id
 
         git_after = capture_git(self.base)
-        agent_after = self._read_agent_state()  # 可能抛 AgentStateError
+        agent_after = self._read_agent_state()
         fresh = bool(agent_after and agent_after.checkpoint_seq > prev_seq)
         if agent_after is not None:
             self.rt.last_agent_checkpoint_seq = max(
@@ -519,7 +628,6 @@ class SupervisorEngine:
             activation_id, run_dir, git_before, git_after, agent_after, prompt, reason, result
         )
 
-        # ---- 计数（每个维度只计一次）----
         if result is None:
             self.rt.counters.crash_restarts += 1
             self.log.emit(PARENT_CRASH, activation=activation_id, error=str(run_error))
@@ -541,7 +649,6 @@ class SupervisorEngine:
                 fresh=fresh,
             )
 
-        # ---- 分派（fresh 状态优先于进程结果，见协议 9）----
         if result.timed_out:
             if agent_after is None or agent_after.status == AgentStatus.RUNNING:
                 self._save_runtime()
@@ -570,7 +677,6 @@ class SupervisorEngine:
             return Outcome(action="wait_human")
         if agent_after.status == AgentStatus.WAIT_CI:
             if result.exit_code != 0:
-                # 文档九：exit1 + fresh WAIT_CI → 仍进 WAIT_CI，记录 anomaly
                 self.log.emit(
                     AGENT_ANOMALY,
                     activation=activation_id,
@@ -579,7 +685,6 @@ class SupervisorEngine:
                 )
             return Outcome(action="wait_ci", agent=agent_after)
 
-        # status == RUNNING
         if result.exit_code == 0:
             if fresh:
                 self.log.emit(PARENT_CLEAN_EXIT_WITH_RUNNING_STATE, activation=activation_id)
@@ -588,7 +693,6 @@ class SupervisorEngine:
             self.rt.counters.clean_restarts += 1
             self._save_runtime()
             return Outcome(action="restart", next_reason="CONTINUE", backoff=False)
-        # 已在上方计入 crash
         self._save_runtime()
         return Outcome(
             action="restart", next_reason="RECOVER_AFTER_PARENT_CRASH", backoff=True

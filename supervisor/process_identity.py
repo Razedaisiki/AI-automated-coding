@@ -36,14 +36,23 @@ def read_cmdline(pid: int):
 def is_proc_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
         # 存在但无权限信号：视为活着
-        return True
+        pass
     except OSError:
         return False
+    # 僵尸进程（Z）虽然 kill(0) 成功，但已无实际执行体，视为死亡
+    try:
+        stat = (_PROC / str(pid) / "stat").read_text(encoding="utf-8")
+        after = stat[stat.rindex(")") + 2 :]
+        state = after.split()[0] if after.split() else ""
+        if state == "Z":
+            return False
+    except OSError:
+        return False
+    return True
 
 
 def identity_matches(pid: int, start_id) -> bool:
@@ -58,3 +67,18 @@ def looks_like_dsh_cmdline(cmdline) -> bool:
     if not cmdline:
         return False
     return "dsh" in cmdline or "headless" in cmdline
+
+
+def is_dsh_process(pid: int) -> bool:
+    """pid 活着、starttime 存在且 cmdline 像 DSH（恢复路径的完整判定）。"""
+    if not is_proc_alive(pid):
+        return False
+    if read_start_id(pid) is None:
+        return False
+    cmdline = read_cmdline(pid)
+    if not cmdline:
+        return False
+    # supervisor 允许的同族进程：DSH 本体、以及未 exec 的 launcher（exec 前后同 pid）
+    if looks_like_dsh_cmdline(cmdline):
+        return True
+    return "launcher" in cmdline

@@ -27,7 +27,7 @@ from .events import EventLog, now_iso
 from .git_probe import capture as capture_git
 from .lock import LockHeldError, SupervisorLock
 from .models import Counters, Limits, RuntimeState, SupervisorStatus
-from .process_identity import is_proc_alive
+from .process_identity import identity_matches, is_proc_alive
 from .prompts import build_prompt
 from .storage import Layout, RuntimeStore, atomic_write_json, load_agent_state
 
@@ -201,6 +201,7 @@ def cmd_parent_once(args) -> int:
             ),
             last_agent_checkpoint_seq=agent_after.checkpoint_seq if agent_after else 0,
             supervisor_pid=None,
+            supervisor_process_start_id=None,
             active_budget={"accrued_seconds": 0.0, "last_mark": None},
             stop_reason=None,
         )
@@ -275,7 +276,13 @@ def cmd_stop(args) -> int:
     repo = _repo(args.repo)
     rt = RuntimeStore(Layout(repo)).load()
     pid = rt.supervisor_pid if rt else None
-    if not pid or not is_proc_alive(pid):
+    sid = rt.supervisor_process_start_id if rt else None
+    if (
+        not pid
+        or not is_proc_alive(pid)
+        or not sid
+        or not identity_matches(pid, sid)
+    ):
         print("supervisor: not running")
         return 1
     os.kill(pid, signal.SIGTERM)

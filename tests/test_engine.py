@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -84,16 +85,17 @@ def write_runtime(repo, *, activation=5, pid=None, start_id=None, counters=None)
         parent_timeout_seconds=c.parent_timeout_seconds,
         terminate_grace_seconds=c.terminate_grace_seconds,
     )
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rt = RuntimeState(
         schema_version=1,
         status=SupervisorStatus.RUNNING_PARENT,
-        task_started_at="2026-08-18T05:00:00Z",
+        task_started_at=now,
         current_parent=(
             ParentInfo(
                 activation_id=activation,
                 pid=pid,
                 process_start_id=start_id,
-                started_at="2026-08-18T06:00:00Z",
+                started_at=now,
                 reason="CONTINUE",
             )
             if pid is not None
@@ -456,7 +458,17 @@ class TestRecovery:
             env=env,
             start_new_session=True,
         )
-        start_id = read_start_id(orphan.pid)
+        for _ in range(20):
+            start_id = read_start_id(orphan.pid)
+            if start_id is not None:
+                try:
+                    if Path(f"/proc/{orphan.pid}/cmdline").read_bytes():
+                        break
+                except OSError:
+                    pass
+            time.sleep(0.05)
+        else:
+            start_id = read_start_id(orphan.pid)
         write_runtime(
             tmp_repo, activation=7, pid=orphan.pid, start_id=start_id,
         )
