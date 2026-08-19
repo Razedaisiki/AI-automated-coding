@@ -79,7 +79,7 @@ class DshRunner:
         self.executable = executable
         self.profile = profile
         self.terminate_grace_seconds = terminate_grace_seconds
-        self.last_pid = None  # 最近一次 spawn 的子进程 pid（cancel 竞态下供引擎确认）
+        self.last_pid = None  # 审计/测试参考：最近一次 spawn 的 pid（引擎判定已统一经 STOPPING 收尾 reconciliation）
 
     async def run(
         self,

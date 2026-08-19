@@ -38,6 +38,7 @@ from .events import (
     PARENT_CRASH,
     PARENT_EXITED,
     PARENT_KILLED,
+    PARENT_KILL_FAILED,
     PARENT_LEASE_HELD,
     PARENT_NO_PROGRESS,
     PARENT_RECORD_STALE,
@@ -86,11 +87,12 @@ def _now_iso() -> str:
 
 @dataclass
 class Outcome:
-    action: str  # restart | wait_ci | wait_human | stop_success | stop_blocked | stop_limit | stop_error
+    action: str  # restart | wait_ci | wait_human | stop_success | stop_blocked | stop_limit | stop_error | complete_stop
     next_reason: Optional[str] = None
     backoff: bool = False
     agent: Optional[AgentState] = None
     limit_reason: Optional[StopReason] = None
+    keep_parent: bool = False  # stop_error 时保留 current_parent 身份（kill 失败可用）
 
 
 class SupervisorEngine:
@@ -153,8 +155,12 @@ class SupervisorEngine:
             result = await self._process_outcome(adoption_result)
             if result is None:
                 pass  # wait_ci / wait_human 已在 _process_outcome 内等待
+            elif result[0] == "complete":
+                return await self._complete_interrupted_stop()
             elif result[0] == "stop":
-                return self._finalize(*result[1:])
+                if len(result) > 4 and result[4]:
+                    return self._finalize(result[1], result[2], result[3], keep_parent=True)
+                return self._finalize(result[1], result[2], result[3])
             else:
                 next_reason = result
         # reconcile 等 lease 期间收到 operator stop（已切入 STOPPING）→ 完成收尾
@@ -182,8 +188,12 @@ class SupervisorEngine:
                     result = await self._process_outcome(outcome)
                     if result is None:
                         continue
+                    if result[0] == "complete":
+                        return await self._complete_interrupted_stop()
                     if result[0] == "stop":
-                        return self._finalize(*result[1:])
+                        if len(result) > 4 and result[4]:
+                            return self._finalize(result[1], result[2], result[3], keep_parent=True)
+                        return self._finalize(result[1], result[2], result[3])
                     next_reason = result
                     continue
 
@@ -202,8 +212,12 @@ class SupervisorEngine:
                         result = await self._process_outcome(outcome)
                         if result is None:
                             continue
+                        if result[0] == "complete":
+                            return await self._complete_interrupted_stop()
                         if result[0] == "stop":
-                            return self._finalize(*result[1:])
+                            if len(result) > 4 and result[4]:
+                                return self._finalize(result[1], result[2], result[3], keep_parent=True)
+                            return self._finalize(result[1], result[2], result[3])
                         next_reason = result
                     continue
                 if agent.status == AgentStatus.WAIT_CI:
@@ -216,8 +230,12 @@ class SupervisorEngine:
                 result = await self._process_outcome(outcome)
                 if result is None:
                     continue
+                if result[0] == "complete":
+                    return await self._complete_interrupted_stop()
                 if result[0] == "stop":
-                    return self._finalize(*result[1:])
+                    if len(result) > 4 and result[4]:
+                        return self._finalize(result[1], result[2], result[3], keep_parent=True)
+                    return self._finalize(result[1], result[2], result[3])
                 next_reason = result
         except AgentStateError as exc:
             self.log.emit(AGENT_STATE_INVALID, error=str(exc))
@@ -243,7 +261,11 @@ class SupervisorEngine:
                 StopReason.SUPERVISOR_INTERNAL_ERROR,
                 SupervisorStatus.STOPPED_ERROR,
                 1,
+                outcome.keep_parent,
             )
+        if outcome.action == "complete_stop":
+            # 与"崩溃后恢复 STOPPING"走完全相同的收尾 reconciliation（P1-R4）
+            return ("complete",)
         if outcome.action == "wait_ci":
             await self._wait_ci(outcome.agent)
             return None
@@ -255,11 +277,14 @@ class SupervisorEngine:
             return outcome.next_reason
         raise AssertionError(f"unknown outcome action {outcome.action!r}")
 
-    def _finalize(self, stop_reason: StopReason, status: SupervisorStatus, rc: int) -> int:
+    def _finalize(self, stop_reason: StopReason, status: SupervisorStatus, rc: int, keep_parent=False) -> int:
         assert self.rt is not None
         self.rt.status = status
         self.rt.stop_reason = stop_reason
-        self.rt.current_parent = None
+        if not keep_parent:
+            # 默认清空 Parent 记录；kill 失败等 fail-closed 场景必须保留身份供后续
+            # 排查/重启 reconciliation（status=STOPPED_ERROR + current_parent 有效）
+            self.rt.current_parent = None
         self._accrue_budget()
         self._save_runtime()
         if status == SupervisorStatus.STOPPED_LIMIT:
@@ -303,24 +328,36 @@ class SupervisorEngine:
                     ok = await terminate_process_group(
                         pid, self.config.limits.terminate_grace_seconds
                     )
+                    if ok:
+                        self.log.emit(
+                            PARENT_KILLED,
+                            activation=activation_id,
+                            pid=pid,
+                            reason=KillReason.OPERATOR_STOP.value,
+                        )
+                        break
+                    # P0-R4：杀组失败 → PARENT_KILL_FAILED + 保留身份 STOPPED_ERROR
+                    #（绝不能写 STOPPED_OPERATOR / 绝不丢弃 current_parent）
                     self.log.emit(
-                        PARENT_KILLED,
+                        PARENT_KILL_FAILED,
                         activation=activation_id,
                         pid=pid,
                         reason=KillReason.OPERATOR_STOP.value,
                     )
-                    if not ok:
-                        return self._finalize(
-                            StopReason.SUPERVISOR_INTERNAL_ERROR,
-                            SupervisorStatus.STOPPED_ERROR,
-                            1,
-                        )
+                    return self._finalize(
+                        StopReason.SUPERVISOR_INTERNAL_ERROR,
+                        SupervisorStatus.STOPPED_ERROR,
+                        1,
+                        keep_parent=True,
+                    )
                 break  # 组长身份可验证且组本就不存在/已清 → 完成 stop
+            # 组长身份不可验证（尚未 spawn / 已死）→ 尝试用 process.json 更新身份，
+            # 仅当能拿到"与当前不同的"记录时才继续重试，否则落入下面的租约判定
             if token:
                 record = self._load_process_record(activation_id)
                 if record is not None and record.get("activation_token") == token:
                     rpid, rsid = record.get("pid"), record.get("process_start_id")
-                    if rpid and rsid:
+                    if rpid and rsid and (rpid != pid or rsid != sid):
                         pid, sid = rpid, rsid
                         continue
             if self._lease_free():
@@ -559,8 +596,18 @@ class SupervisorEngine:
                 self._save_runtime()
                 return None
             # 记录存在但陈旧：清理残留组（仅当组长身份可验证）→ 保守 crash 恢复
-            await self._clean_recorded_group(record.get("pid"), record.get("process_start_id"))
+            cleaned = await self._clean_recorded_group(
+                record.get("pid"), record.get("process_start_id")
+            )
             self.log.emit(PARENT_RECORD_STALE, activation=parent.activation_id)
+            if not cleaned:
+                # P0-R4：残留组仍在 → 把记录里的真实 pid/start_id 写回 current_parent
+                # 保留身份，fail-closed（绝不 restart 继续开发）
+                parent.pid = record.get("pid")
+                parent.process_start_id = record.get("process_start_id")
+                self.rt.current_parent = parent
+                self._save_runtime()
+                return Outcome(action="stop_error", keep_parent=True)
             self.rt.current_parent = None
             self._save_runtime()
             return self._outcome_from_agent_state("RECOVER_AFTER_PARENT_CRASH")
@@ -636,29 +683,42 @@ class SupervisorEngine:
         # 状态未知/RUNNING：退出方式未知 → 保守按 crash 恢复
         return Outcome(action="restart", next_reason=crash_reason, backoff=True)
 
-    async def _clean_recorded_group(self, pid, start_id=None) -> None:
+    async def _clean_recorded_group(self, pid, start_id=None) -> bool:
         """记录的 leader 已死但组内还有成员（子进程）时，清理残留进程组。
 
         安全约束（P0-2/“绝不错杀”）：**必须** start_id 非空且组长身份可验证
         （leader 还在，哪怕已僵尸——starttime 仍可从 /proc 读到）才允许按 pgid
         杀组；start_id 缺失或身份不符时，组内残留可能是 PID 复用后的无关会话组，
         **绝不**按裸 pid 冒险杀组，宁可留给 operator。
+
+        返回 True = 清理完成 / 无可清理（不算失败）；False = 已验证的残留组
+        在终止后仍未消失（调用方**必须 fail-closed**：保留身份、绝不 restart；
+        属于 STALE_GROUP_CLEANUP kill failure）。
         """
         if not pid or not start_id:
-            return
+            return True
         if not identity_matches(pid, start_id):
-            return  # 组长身份无法确认 → 不按裸 pid 杀组
+            return True  # 身份不可验证 → 不清理，也不阻止后续流程
         if not process_group_alive(pid):
-            return
+            return True
         from .dsh_runner import terminate_process_group
 
+        ok = await terminate_process_group(pid, self.config.limits.terminate_grace_seconds)
+        if ok:
+            self.log.emit(
+                PARENT_KILLED,
+                activation=0,
+                pid=pid,
+                reason=KillReason.STALE_GROUP_CLEANUP.value,
+            )
+            return True
         self.log.emit(
-            PARENT_KILLED,
+            PARENT_KILL_FAILED,
             activation=0,
             pid=pid,
             reason=KillReason.STALE_GROUP_CLEANUP.value,
         )
-        await terminate_process_group(pid, self.config.limits.terminate_grace_seconds)
+        return False
 
     def _orphan_live(self, pid, sid) -> bool:
         return bool(pid) and is_proc_alive(pid) and identity_matches(pid, sid) and is_dsh_process(pid)
@@ -686,10 +746,14 @@ class SupervisorEngine:
         # RUNNING_PARENT 完整判定（含 cmdline）
         if not self._orphan_live(pid, sid):
             # 记录的 leader 死了：若组里还有成员（被遗弃的子进程），先清组
-            await self._clean_recorded_group(pid, sid)
+            cleaned = await self._clean_recorded_group(pid, sid)
             self.rt.counters.parent_activations = max(
                 self.rt.counters.parent_activations, parent.activation_id
             )
+            if not cleaned:
+                # P0-R4：残留组未被清掉 → 保留身份 fail-closed（绝不 restart）
+                self._save_runtime()
+                return Outcome(action="stop_error", keep_parent=True)
             self.rt.current_parent = None
             self._save_runtime()
             return self._outcome_from_agent_state("RECOVER_AFTER_PARENT_CRASH")
@@ -732,17 +796,17 @@ class SupervisorEngine:
 
         # —— 收尾：清当前 Parent 记录 ——
         if kill_failed:
-            # P1-B1：PGID 熬过了 SIGKILL+确认窗口 → 绝不能宣称 PARENT_KILLED/收尾完成，
-            # 以内部错误终局（operator 需要介入）
+            # P0-R4：PGID 熬过了 SIGKILL+确认窗口 → 记录 PARENT_KILL_FAILED
+            # （不是 PARENT_KILLED——没有 kill 成功），**保留 current_parent 身份**
+            # fail-closed（绝不 restart 继续开发）。
             self.log.emit(
-                PARENT_KILLED,
+                PARENT_KILL_FAILED,
                 activation=parent.activation_id,
                 pid=pid,
-                reason=(killed_by.value if killed_by else "") + "_SURVIVED",
+                reason=(killed_by.value if killed_by else ""),
             )
-            self.rt.current_parent = None
             self._save_runtime()
-            return Outcome(action="stop_error")
+            return Outcome(action="stop_error", keep_parent=True)
         self.rt.counters.parent_activations = max(
             self.rt.counters.parent_activations, parent.activation_id
         )
@@ -856,23 +920,10 @@ class SupervisorEngine:
             except (asyncio.CancelledError, Exception):
                 pass
             self.log.emit(OPERATOR_STOP, activation=activation_id)
-            # P1-B1：取消后的进程组必须确认消失，否则绝不以 STOPPED_OPERATOR 收场。
-            # on_start 可能尚未触发（cancel 与 spawn 竞态）→ 用 runner 最近一次
-            # 的 spawn pid 兜底，绝不在进程组可能仍 alive 时圆满收尾。
-            known_pid = None
-            if self.rt.current_parent is not None:
-                known_pid = self.rt.current_parent.pid
-            if known_pid is None:
-                known_pid = getattr(self.runner, "last_pid", None)
-            if known_pid and process_group_alive(known_pid):
-                self.log.emit(
-                    PARENT_KILLED,
-                    activation=activation_id,
-                    pid=known_pid,
-                    reason=KillReason.OPERATOR_STOP.value + "_SURVIVED",
-                )
-                return Outcome(action="stop_error")
-            return None
+            # P1-R4：与"崩溃后恢复 STOPPING"走同一套收尾 reconciliation——
+            # pid 已知→杀组；pid 未知→process.json；record 未知→parent.lock 租约。
+            # 取消路径不再做 ad-hoc last_pid 特判，统一交给 _complete_interrupted_stop。
+            return Outcome(action="complete_stop")
 
         stop_task.cancel()
         try:
@@ -882,18 +933,22 @@ class SupervisorEngine:
             result = None
             run_error = exc
 
+        if result is not None and result.group_survived:
+            # P0-R4：超时终止失败（进程组仍存活）→ 绝不能 restart；**保留
+            # current_parent 身份**（activation_id/pid/start_id/token）供后续排查，
+            # 并记录 PARENT_KILL_FAILED（不是 PARENT_KILLED）→ STOPPED_ERROR。
+            self.log.emit(
+                PARENT_KILL_FAILED,
+                activation=activation_id,
+                pid=self.rt.current_parent.pid if self.rt.current_parent else None,
+                reason=KillReason.PARENT_TIMEOUT.value,
+            )
+            self.rt.counters.parent_activations = activation_id
+            self._save_runtime()
+            return Outcome(action="stop_error", keep_parent=True)
+
         self.rt.current_parent = None
         self.rt.counters.parent_activations = activation_id
-
-        if result is not None and result.group_survived:
-            # P1-B1：超时终止后整组仍未消失 → 不能继续开发，以内部错误收场
-            self.log.emit(
-                PARENT_CRASH,
-                activation=activation_id,
-                error="process group survived SIGKILL",
-            )
-            self._save_runtime()
-            return Outcome(action="stop_error")
 
         git_after = capture_git(self.base)
         agent_after = self._read_agent_state()

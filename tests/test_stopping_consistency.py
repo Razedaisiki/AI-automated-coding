@@ -34,6 +34,7 @@ from supervisor.storage import Layout, RuntimeStore, atomic_write_json
 from conftest import FAKE_DSH, FakeParentRunner, StepScript, event_names, run_engine, wait_until
 
 from test_hardening import _runtime_dict, _spawn_orphan, _write_agent_state, _write_runtime
+from test_hardening2 import _proc_state, _same_group_child
 
 
 def _iso_now():
@@ -219,8 +220,8 @@ class TestStoppingLeaseReconciliation:
 
 class TestTerminationFailsClosed:
     def test_operator_stop_with_surviving_group_errors(self, tmp_repo, monkeypatch):
-        """P1-B1：终止后 PGID 仍 alive → terminate_process_group 返回 False →
-        Supervisor 绝不以 STOPPED_OPERATOR 收场，改为 STOPPED_ERROR。"""
+        """P0-B：终止后 PGID 仍 alive → STOPPED_ERROR，且**保留 current_parent 身份**
+        （pid/start_id）——绝不丢给后续排查，也绝不清掉让重启时误判可 spawn。"""
         import supervisor.dsh_runner as dsh_runner
 
         orphan, start_id = _spawn_orphan(tmp_repo)
@@ -259,7 +260,13 @@ class TestTerminationFailsClosed:
         rt = RuntimeStore(Layout(tmp_repo)).load()
         assert rt.status == SupervisorStatus.STOPPED_ERROR
         assert rt.stop_reason == StopReason.SUPERVISOR_INTERNAL_ERROR
-        assert "SUPERVISOR_STOPPED" in event_names(engine)  # 有终态事件
+        # 身份必须保留（fail-closed：不能丢 activation_id/pid/start_id/token）
+        assert rt.current_parent is not None
+        assert rt.current_parent.pid == orphan.pid
+        assert rt.current_parent.process_start_id == start_id
+        # 审计：不是 PARENT_KILLED（没杀掉），而是 PARENT_KILL_FAILED
+        assert "PARENT_KILL_FAILED" in event_names(engine)
+        assert "SUPERVISOR_STOPPED" in event_names(engine)
         # 清理：真实进程组由测试兜底杀掉
         try:
             os.killpg(orphan.pid, signal.SIGKILL)
@@ -270,9 +277,10 @@ class TestTerminationFailsClosed:
         except subprocess.TimeoutExpired:
             pass
 
-    def test_stop_cancel_verifies_group_gone(self, tmp_repo, monkeypatch):
-        """P1-B1：operator stop 取消激活后，引擎必须确认进程组已消失；
-        仍 alive → STOPPED_ERROR，绝不写 STOPPED_OPERATOR。"""
+    def test_stop_cancel_fails_closed_and_keeps_identity(self, tmp_repo, monkeypatch):
+        """P0-B：operator stop 取消激活后，统一收尾 reconciliation 也要 fail-closed：
+        进程组仍 alive → STOPPED_ERROR，保留 current_parent 身份。"""
+        import supervisor.dsh_runner as dsh_runner
         from supervisor.dsh_runner import DshRunner
 
         monkeypatch.setenv("FAKE_DSH_MODE", "hang")
@@ -289,22 +297,23 @@ class TestTerminationFailsClosed:
         )
         runner = DshRunner(executable=str(FAKE_DSH), profile="headless", terminate_grace_seconds=1)
 
-        async def fake_terminate(proc):  # 模拟终止完全没生效
+        async def fake_terminate(proc):  # 取消路径的终止完全没生效
+            return False
+
+        async def fake_tpg(pid, grace):  # 收尾 reconciliation 的终止也失败
             return False
 
         monkeypatch.setattr(runner, "_terminate_group", fake_terminate)
+        monkeypatch.setattr(dsh_runner, "terminate_process_group", fake_tpg)
         cfg = default_config()
         cfg.limits.terminate_grace_seconds = 1
         engine = SupervisorEngine(base_dir=tmp_repo, config=cfg, runner=runner)
-        real_pid = {"pid": None}
 
         async def control(eng):
             await wait_until(
                 lambda: bool(EventLog(eng.layout.events_path).events_named("PARENT_STARTED"))
             )
             await asyncio.sleep(0.3)
-            rt = RuntimeStore(Layout(eng.base)).load()
-            real_pid["pid"] = rt.current_parent.pid if rt.current_parent else None
             eng.request_stop()
 
         rc = run_engine(engine, control)
@@ -312,11 +321,138 @@ class TestTerminationFailsClosed:
         rt = RuntimeStore(Layout(tmp_repo)).load()
         assert rt.status == SupervisorStatus.STOPPED_ERROR
         assert rt.stop_reason == StopReason.SUPERVISOR_INTERNAL_ERROR
+        assert rt.current_parent is not None, "kill failure must keep parent identity"
+        assert rt.current_parent.pid  # 真实子进程 pid 必须保留
+        assert "PARENT_KILL_FAILED" in event_names(engine)
         # 清理真实子进程组
-        if real_pid["pid"]:
+        if rt.current_parent and rt.current_parent.pid:
             try:
-                os.killpg(real_pid["pid"], signal.SIGKILL)
+                os.killpg(rt.current_parent.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
+                pass
+
+    def test_activation_timeout_surviving_group_keeps_identity(self, tmp_repo, monkeypatch):
+        """P0-B：正常 activation 超时终止失败（group_survived）→ STOPPED_ERROR 且
+        保留 current_parent 身份，绝不 restart。"""
+        from supervisor.dsh_runner import DshRunner
+
+        monkeypatch.setenv("FAKE_DSH_MODE", "hang")
+        monkeypatch.setenv(
+            "FAKE_DSH_STATE",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "RUNNING",
+                    "checkpoint_seq": 1,
+                    "updated_at": "2026-08-18T06:00:00Z",
+                }
+            ),
+        )
+        runner = DshRunner(executable=str(FAKE_DSH), profile="headless", terminate_grace_seconds=1)
+
+        async def fake_terminate(proc):
+            return False  # 终止失败 → 进程组存活
+
+        monkeypatch.setattr(runner, "_terminate_group", fake_terminate)
+        cfg = default_config()
+        cfg.limits.parent_timeout_seconds = 1
+        cfg.limits.terminate_grace_seconds = 1
+        engine = SupervisorEngine(base_dir=tmp_repo, config=cfg, runner=runner)
+
+        rc = run_engine(engine)  # 无 control：超时自动触发
+        assert rc == 1
+        rt = RuntimeStore(Layout(tmp_repo)).load()
+        assert rt.status == SupervisorStatus.STOPPED_ERROR
+        assert rt.stop_reason == StopReason.SUPERVISOR_INTERNAL_ERROR
+        assert rt.current_parent is not None and rt.current_parent.pid
+        assert "PARENT_KILL_FAILED" in event_names(engine)
+        # 绝不 restart：只有最开始那一次 PARENT_STARTING
+        assert len(EventLog(Layout(tmp_repo).events_path).events_named("PARENT_STARTING")) == 1
+        # 清理真实子进程组
+        if rt.current_parent and rt.current_parent.pid:
+            try:
+                os.killpg(rt.current_parent.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def test_stale_group_kill_failure_fails_closed(self, tmp_repo, monkeypatch):
+        """P0-B：dead-leader + 残留子进程 + 清理杀组失败 → 保留身份 STOPPED_ERROR，
+        绝不 restart 继续开发。"""
+        import supervisor.dsh_runner as dsh_runner
+
+        env = dict(os.environ, FAKE_DSH_MODE="hang_with_ignoring_child")
+        parent = subprocess.Popen(
+            [sys.executable, str(FAKE_DSH), "orphan-task"],
+            cwd=str(tmp_repo),
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            sid = None
+            for _ in range(50):
+                sid = read_start_id(parent.pid)
+                if sid is not None:
+                    try:
+                        if Path(f"/proc/{parent.pid}/cmdline").read_bytes():
+                            break
+                    except OSError:
+                        pass
+                time.sleep(0.05)
+            for _ in range(50):
+                if _same_group_child(parent.pid) is not None:
+                    break
+                time.sleep(0.05)
+            # 只杀 leader（成僵尸），子进程留在组里
+            os.kill(parent.pid, signal.SIGKILL)
+            for _ in range(50):
+                if _proc_state(parent.pid) == "Z":
+                    break
+                time.sleep(0.05)
+            assert _proc_state(parent.pid) == "Z"
+            assert process_group_alive(parent.pid)
+
+            _write_runtime(
+                tmp_repo,
+                _runtime_dict(
+                    tmp_repo,
+                    current_parent={
+                        "activation_id": 5,
+                        "pid": parent.pid,
+                        "process_start_id": sid,
+                        "started_at": _iso_now(),
+                        "reason": "CONTINUE",
+                    },
+                    counters=_counter_dict(activations=4),
+                ),
+            )
+            _write_agent_state(tmp_repo, seq=5)
+            cfg = default_config()
+            cfg.limits.terminate_grace_seconds = 0.5
+            cfg.restart.backoff_seconds = [0.01]
+
+            async def fake_tpg(pid, grace):
+                return False  # 清理杀组失败
+
+            monkeypatch.setattr(dsh_runner, "terminate_process_group", fake_tpg)
+            runner = FakeParentRunner([StepScript.completed()], Layout(tmp_repo))
+            engine = SupervisorEngine(base_dir=tmp_repo, config=cfg, runner=runner)
+            rc = run_engine(engine)
+            assert rc == 1
+            rt = RuntimeStore(Layout(tmp_repo)).load()
+            assert rt.status == SupervisorStatus.STOPPED_ERROR
+            assert rt.stop_reason == StopReason.SUPERVISOR_INTERNAL_ERROR
+            assert rt.current_parent is not None
+            assert rt.current_parent.pid == parent.pid
+            assert "PARENT_KILL_FAILED" in event_names(engine)
+            assert runner.calls == []  # 绝不 restart
+        finally:
+            try:
+                os.killpg(parent.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                parent.wait(timeout=3)
+            except subprocess.TimeoutExpired:
                 pass
 
 

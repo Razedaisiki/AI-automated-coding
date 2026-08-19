@@ -145,6 +145,68 @@ class TestParentLease:
                 holder.kill()
                 holder.wait()
 
+    def test_release_is_fd_handoff_not_unlock(self, tmp_repo, monkeypatch):
+        """P0-R4：Supervisor 结束激活时只 close 自己的 FD 副本（handoff），
+        **绝不 LOCK_UN** —— 子进程/DSH 仍持有锁；子进程死后锁自动释放。"""
+        from supervisor.dsh_runner import DshRunner
+
+        monkeypatch.setenv("FAKE_DSH_MODE", "hang")
+        lease_path = tmp_repo / ".supervisor" / "parent.lock"
+        lease = ParentLease(lease_path)
+        lease.acquire()
+        child = None
+
+        async def go():
+            nonlocal child
+            runner = DshRunner(
+                executable=str(FAKE_DSH), profile="headless", terminate_grace_seconds=1
+            )
+            task = asyncio.ensure_future(
+                runner.run(
+                    repo=tmp_repo,
+                    prompt="handoff test",
+                    activation_id=1,
+                    timeout_seconds=30,
+                    run_dir=Layout(tmp_repo).run_dir(1),
+                    activation_token="tok-handoff",
+                    lease_fd=lease.fd,
+                )
+            )
+            await asyncio.sleep(1.5)
+            child = runner.last_pid
+            # 模拟激活结束：Supervisor 只 close 自己的 FD 副本（不做 LOCK_UN）
+            lease.release()
+            # 子进程仍活着 → 租约必须仍被占用（否则破坏"旧 activation 活着绝不 spawn"）
+            assert not ParentLease(lease_path).try_acquire(), "handoff wrongly released child lease"
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        asyncio.run(go())
+        # 子进程已死 → 不再需要任何 release，租约自动释放
+        self._wait_lease_free(lease_path)
+        fresh = ParentLease(lease_path)
+        assert fresh.try_acquire() is True
+        fresh.release()
+        # 清理任何残留
+        if child:
+            try:
+                os.killpg(child, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    @staticmethod
+    def _wait_lease_free(lease_path, timeout=5.0):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            fresh = ParentLease(lease_path)
+            if fresh.try_acquire():
+                fresh.release()
+                return
+            time.sleep(0.05)
+
     def test_lease_fd_inherited_by_spawned_child_and_auto_released(self, tmp_repo):
         """P0-1 机制：Supervisor 获得 lease 后把已锁 FD 传给 launcher→exec 后的 DSH；
         子进程存活期间 lease 必须被占用；子进程死亡后 lease 自动释放。"""

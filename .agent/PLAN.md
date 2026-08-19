@@ -1,4 +1,4 @@
-# .agent/PLAN.md — M5 hardening（第 1+2+3 轮评审意见）
+# .agent/PLAN.md — M5 hardening（第 1+2+3+4 轮评审意见）
 
 ## 目标
 
@@ -37,10 +37,25 @@
 | H19 | tests/test_stopping_consistency.py 6 项（durable STOPPING、wait-record-then-kill、
       stop cut-in 无 PSU、surviving-group→STOPPED_ERROR×2、identity-guarded kill） | DONE |
 | H20 | 协议 §12/§13、delivery-report-r2 标注 historical、PLAN/STATE/FINAL_REPORT 更新 | DONE |
+| H21 | **lease FD handoff**：`ParentLease.release()` 改为只 close 自己的 FD 副本、
+      **绝不 LOCK_UN**（对共享 OFD 的 LOCK_UN 会连 DSH 的租约一起解掉）；
+      DSH/其后代存活时 supervisor close 自己的副本不会破坏租约 | DONE |
+| H22 | **kill failure 保留身份 + fail-closed**：所有 `terminate_process_group(False)`
+      路径保留 `current_parent`（activation_id/pid/start_id/token），绝不 restart、
+      绝不清空身份；`_finalize(keep_parent=True)` 落地 | DONE |
+| H23 | **stale-group 清理返回值被忽略**：`_clean_recorded_group` 返回 bool，
+      失败 → STOPPED_ERROR（保留身份），不再在残留组存活时继续开发 | DONE |
+| H24 | **审计 PARENT_KILL_FAILED**：终止成功记 PARENT_KILLED、失败记
+      PARENT_KILL_FAILED（不混用）；协议 §10 事件表补充 | DONE |
+| H25 | **统一 stop 收尾**：operator-stop 取消激活也走 `_complete_interrupted_stop`
+      reconciliation（去掉 ad-hoc last_pid 判定），修复 record 已死导致的无限循环 | DONE |
+| H26 | tests：handoff、stale-cleanup failure、timeout group_survived keep identity、
+      cancel fails-closed keep identity 等（stopping-consistency + handoff） | DONE |
+| H27 | 协议 §10/§12、PLAN/STATE/FINAL_REPORT 更新 | DONE |
 
 ## 验收（可命令验证）
 
-- `python -m pytest -q` → **93 passed**
+- `python -m pytest -q` → **96 passed**
 - STOPPING 恢复：磁盘 runtime 保持 STOPPING；STOPPING+pid 未知+lease held →
   等 record（token 匹配）出现后杀组 → STOPPED_OPERATOR；等不到时绝不结束 stop
 - reconcile 等 lease 中收到 stop → 切入 STOPPING，无 PARENT_SPAWN_UNCONFIRMED

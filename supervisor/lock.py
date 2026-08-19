@@ -103,12 +103,20 @@ class ParentLease:
         return self
 
     def release(self) -> None:
+        """释放本对象持有的 FD 副本——**只 close，绝不 `LOCK_UN`**（FD handoff）。
+
+        flock 锁绑定在 open-file-description 上：经 fork/pass_fds 继承的 FD 与
+        本对象的 FD 共享同一个锁实例。若在子进程（launcher→DSH）仍持有该 OFD 时
+        执行 `LOCK_UN`，会把子进程的租约一起解掉——恰好破坏"旧 activation 活着
+        时绝不 spawn 第二个 Parent"。
+
+        因此唯一正确的解锁路径是关闭 FD：当本副本被 close 后，锁仍由仍持有该
+        OFD 的子进程（DSH/其后代）继续持有；直到最后一个副本关闭（内核自动
+        释放锁）。若从未成功 spawn（本副本是唯一持有者），close 后锁即消失。
+        """
         if self._fd is not None:
-            try:
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
-            finally:
-                os.close(self._fd)
-                self._fd = None
+            os.close(self._fd)
+            self._fd = None
 
     @property
     def held(self) -> bool:

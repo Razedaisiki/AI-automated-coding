@@ -101,7 +101,6 @@ class FakeParentRunner:
         self.last = None
         self.calls = []        # activation ids
         self.prompts = []      # 每个 activation 收到的 prompt
-        self.last_pid = 999999  # 与 on_start(999999,...) 保持一致（无真实子进程）
         self._seq = 0
 
     def _next(self):

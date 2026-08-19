@@ -251,6 +251,7 @@ INVALID_AGENT_STATE | SUPERVISOR_INTERNAL_ERROR | OPERATOR_STOP
 {"ts":"...","event":"PARENT_CRASH","activation":1,"exit_code":1}
 {"ts":"...","event":"PARENT_TIMEOUT","activation":1}
 {"ts":"...","event":"PARENT_KILLED","activation":1,"pid":1234,"reason":"PARENT_TIMEOUT"}
+{"ts":"...","event":"PARENT_KILL_FAILED","activation":2,"pid":1234,"reason":"PARENT_TIMEOUT"}  # 终止失败（进程组仍存活）
 {"ts":"...","event":"RESTART_BACKOFF","seconds":5,"reason":"RECOVER_AFTER_PARENT_CRASH"}
 {"ts":"...","event":"LIMIT_REACHED","reason":"MAX_CRASH_RESTARTS"}
 {"ts":"...","event":"SUPERVISOR_STOPPED","status":"STOPPED_LIMIT","stop_reason":"MAX_CRASH_RESTARTS"}
@@ -293,11 +294,14 @@ INVALID_AGENT_STATE | SUPERVISOR_INTERNAL_ERROR | OPERATOR_STOP
 - **Parent 唯一性租约（Parent lease）**：Supervisor 在每次 spawn 前
   `flock` `.supervisor/parent.lock`，并把已锁 FD 通过 `pass_fds` +
   `SUPERVISOR_PARENT_LOCK_FD` 传给 launcher；`os.execvp` 不关闭该 FD，
-  因此 exec 后的 DSH 进程继续持有租约。DSH 死亡时内核关闭 FD，flock 自动释放。
+  因此 exec 后的 DSH 进程继续持有租约。
+- 租约是 **FD handoff，不是释放**：激活收尾时 Supervisor 只 `close` 自己那份
+  FD 副本，**绝不 `LOCK_UN`**（flock 锁绑定在 open-file-description 上，对共享
+  OFD 的继承 FD 执行 `LOCK_UN` 会连 DSH 的租约一起解掉）。子进程存活 → 锁继续
+  被 DSH 持有；直到最后一个持有该 OFD 的 FD 关闭，内核才自动释放锁。
   作用分工：`process.json` = **身份发现**（pid/starttime/token）；
   `parent.lock` 租约 = **唯一性保证**。重启的 Supervisor 拿不到租约 =
-  存在活着的旧 activation = **绝不 spawn 第二个 Parent**（等记录出现 /
-  等租约释放 / 等 operator stop）。
+  存在活着的旧 activation = **绝不 spawn 第二个 Parent**。
 - Supervisor 只在 `dsh` 与只读 `git`/CI 工具之间受限启动程序；**绝不**
   `shell=True` 执行任意字符串。
 - Supervisor 收到 SIGINT/SIGTERM：runtime 置 `STOPPING` 并落盘 → SIGTERM
@@ -314,9 +318,16 @@ INVALID_AGENT_STATE | SUPERVISOR_INTERNAL_ERROR | OPERATOR_STOP
 - **终止失败必须显式失败**：`terminate_process_group` / `_terminate_group`
   若 SIGKILL+确认窗口后整个 PGID 仍存在 → 返回失败；Supervisor **绝不**在
   Parent 仍 alive 时写 `STOPPED_OPERATOR`，改为 `STOPPED_ERROR`
-  （`SUPERVISOR_INTERNAL_ERROR`）。
+  （`SUPERVISOR_INTERNAL_ERROR`），并**保留 `current_parent` 身份**
+  （activation_id/pid/start_id/token），绝不丢给后续排查/重启 reconciliation。
+- 审计区分成败：终止成功记 `PARENT_KILLED`；终止失败记 `PARENT_KILL_FAILED`，
+  不用同一个事件既表示 "killed" 又表示 "没能 kill 掉"。
 - 按 PGID 杀组**必须身份可验证**：`start_id` 缺失或与 `/proc` starttime 不符
   时，绝不按裸 pid 杀（PID 复用风险），宁可无法自动清理，留给 operator。
+- 统一的 stop 收尾 reconciliation：无论 STOPPING 来自“崩溃后恢复”还是“当前进程
+  刚收到 SIGTERM 取消激活”，都走同一套 —— PID 已验证 → 杀组；PID 未知 →
+  `process.json`（token 匹配）；record 未知 → `parent.lock` 租约；确认没有
+  activation 后才 `STOPPED_OPERATOR`。
 
 ---
 
