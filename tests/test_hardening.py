@@ -102,8 +102,11 @@ def _spawn_orphan(repo):
 
 
 def _pgid_alive(pid):
-    from supervisor.process_identity import is_proc_alive
+    """组或 leader 是否还"活着"：优先按进程组判定，非组长进程回退 leader 判定。"""
+    from supervisor.process_identity import is_proc_alive, process_group_alive
 
+    if process_group_alive(pid):
+        return True
     return is_proc_alive(pid)
 
 

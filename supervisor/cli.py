@@ -25,7 +25,7 @@ from .dsh_runner import DshRunner
 from .engine import SupervisorEngine
 from .events import EventLog, now_iso
 from .git_probe import capture as capture_git
-from .lock import LockHeldError, SupervisorLock
+from .lock import LockHeldError, ParentLease, SupervisorLock
 from .models import Counters, Limits, RuntimeState, SupervisorStatus
 from .process_identity import identity_matches, is_proc_alive
 from .prompts import build_prompt
@@ -125,6 +125,12 @@ def cmd_parent_once(args) -> int:
     layout.ensure_dirs()
     lock = SupervisorLock(layout.lock_path)
     lock.acquire()
+    lease = ParentLease(layout.parent_lock_path)
+    if not lease.try_acquire():
+        lock.release()
+        raise LockHeldError(
+            "Parent lease held by a live activation; refusing to spawn a second Parent"
+        )
     try:
         rt = RuntimeStore(layout).load()
         activation_id = (rt.counters.parent_activations if rt and rt.counters else 0) + 1
@@ -147,6 +153,7 @@ def cmd_parent_once(args) -> int:
                 activation_id=activation_id,
                 timeout_seconds=config.limits.parent_timeout_seconds,
                 run_dir=run_dir,
+                lease_fd=lease.fd,
             )
         )
         git_after = capture_git(repo)
@@ -217,6 +224,7 @@ def cmd_parent_once(args) -> int:
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0 if result.exit_code == 0 else 1
     finally:
+        lease.release()
         lock.release()
 
 

@@ -71,6 +71,19 @@ class StopReason(str, Enum):
     OPERATOR_STOP = "OPERATOR_STOP"
 
 
+class KillReason(str, Enum):
+    """**内部**进程组终止原因（M5 hardening）。
+
+    仅用于审计日志（PARENT_KILLED 的 reason 字段）与收养路径的本地决策；
+    不是 Supervisor 终态，绝不写入 `stop_reason`。终态只允许 `StopReason`。
+    """
+
+    OPERATOR_STOP = "OPERATOR_STOP"
+    PARENT_TIMEOUT = "PARENT_TIMEOUT"
+    MAX_ACTIVE_WALL_TIME = "MAX_ACTIVE_WALL_TIME"
+    STALE_GROUP_CLEANUP = "STALE_GROUP_CLEANUP"
+
+
 AGENT_SCHEMA_VERSION = 1
 RUNTIME_SCHEMA_VERSION = 1
 

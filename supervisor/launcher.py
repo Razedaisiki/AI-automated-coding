@@ -2,12 +2,15 @@
 
 Supervisor 先在 runtime 里持久化 STARTING_PARENT + activation_token，
 再启动本脚本。本脚本在 exec DSH **之前**，自己原子写进程记录
-`.supervisor/runs/activation-N/process.json`（pid / start_id / token），
-然后 `os.execvp` 替换为 DSH（exec 前后同一 pid、同一 starttime）。
+`.supervisor/runs/activation-N/process.json`（pid / start_id / token /
+继承的租约 FD），然后 `os.execvp` 替换为 DSH（exec 前后同一 pid、同一 starttime）。
 
-即使 Supervisor 在 spawn 与 on_start（pid 落盘）之间被 kill -9，
-子进程的身份信息也已经由它自己留在磁盘上 —— 重启后的 Supervisor
-据此决定收养还是重新 spawn，彻底杜绝重复 Parent。
+职责分工（P0-1 hardening）：
+- `process.json` = **身份发现**：重启后的 Supervisor 据此知道旧激活的 pid/starttime/token。
+- `parent.lock` 租约 = **唯一性保证**：Supervisor 在 spawn 前已 flock 该文件，
+  并把已锁 FD 经 `pass_fds`/`SUPERVISOR_PARENT_LOCK_FD` 继承给本脚本，
+  `os.execvp` 不清除该 FD → 由 exec 后的 DSH 继续持有。只要 DSH 活着，
+  任何重启的 Supervisor 都拿不到租约，从而**绝不 spawn 第二个 Parent**。
 """
 
 import argparse
@@ -46,6 +49,16 @@ def main(argv=None) -> int:
         print("launcher: no command to exec", file=sys.stderr)
         return 127
 
+    # 继承的租约 FD（Supervisor 已 flock；exec DSH 后继续持有 = Parent 唯一性保证）
+    lock_fd = None
+    raw_fd = os.environ.get("SUPERVISOR_PARENT_LOCK_FD")
+    if raw_fd:
+        try:
+            os.fstat(int(raw_fd))
+            lock_fd = int(raw_fd)
+        except (ValueError, OSError):
+            lock_fd = None
+
     _atomic_write_json(
         args.record,
         {
@@ -53,6 +66,7 @@ def main(argv=None) -> int:
             "process_start_id": read_start_id(os.getpid()),
             "activation_id": args.activation_id,
             "activation_token": args.token,
+            "parent_lock_fd": lock_fd,
             "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         },
     )

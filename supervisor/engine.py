@@ -2,8 +2,12 @@
 
 - 三态恢复：NO_PARENT / STARTING_PARENT(pid=None + token) / RUNNING_PARENT(pid+start_id)
 - STARTING_PARENT 通过 launcher 自写的 process.json 进行 reconciliation（有界宽限）
-- PARENT_STARTING → PARENT_STARTED 拆分审计
-- 收养期间：stop→杀进程组，parent timeout / wall-time 继续生效，cmdline 校验接入
+- Parent lease（P0-1）：spawn 前 flock `.supervisor/parent.lock` 并把已锁 FD 交给
+  launcher→exec 后的 DSH；拿不到租约 = 存在活着的旧 activation → 绝不 spawn 第二个 Parent
+- 整组终止（P0-2）：SIGTERM→grace→SIGKILL 后确认整个 PGID 消失，而非只看 leader PID
+- 收养期间：stop→杀进程组（STOPPING 落盘）、parent timeout / wall-time 继续生效
+- 收养 timeout → RECOVER_AFTER_PARENT_TIMEOUT + 退避；orphan 自退且状态未知 →
+  保守 RECOVER_AFTER_PARENT_CRASH（P1）
 - supervisor 自身 PID 身份写入 runtime
 """
 
@@ -34,6 +38,7 @@ from .events import (
     PARENT_CRASH,
     PARENT_EXITED,
     PARENT_KILLED,
+    PARENT_LEASE_HELD,
     PARENT_NO_PROGRESS,
     PARENT_RECORD_STALE,
     PARENT_RECONCILED,
@@ -51,19 +56,26 @@ from .events import (
     EventLog,
 )
 from .git_probe import capture as capture_git
-from .lock import LockHeldError, SupervisorLock
+from .lock import LockHeldError, ParentLease, SupervisorLock
 from .models import (
     AgentState,
     AgentStateError,
     AgentStatus,
     Counters,
+    KillReason,
     Limits,
     ParentInfo,
     RuntimeState,
     StopReason,
     SupervisorStatus,
 )
-from .process_identity import identity_matches, is_dsh_process, is_proc_alive, read_start_id
+from .process_identity import (
+    identity_matches,
+    is_dsh_process,
+    is_proc_alive,
+    process_group_alive,
+    read_start_id,
+)
 from .prompts import build_prompt
 from .storage import Layout, RuntimeStore, atomic_write_json, load_agent_state, read_json_strict
 
@@ -97,6 +109,8 @@ class SupervisorEngine:
         self._stop_requested = False
         self.lock = None
         self.rt: Optional[RuntimeState] = None
+        self.lease = ParentLease(self.layout.parent_lock_path)
+        self._interrupted_stop = False
 
     @property
     def stop_event(self):
@@ -129,12 +143,27 @@ class SupervisorEngine:
             )
             self._save_runtime()
         self.log.emit(SUPERVISOR_STARTED, supervisor_pid=os.getpid())
-        await self._adopt_orphan_if_needed()
 
+        # 上次收尾在终止宽限期内崩溃（runtime 定格 STOPPING）→ 完成未被完成的 operator stop
+        if self._interrupted_stop:
+            return await self._complete_interrupted_stop()
+
+        adoption_result = await self._adopt_orphan_if_needed()
         next_reason: Optional[str] = None
+        if adoption_result is not None:
+            result = await self._process_outcome(adoption_result)
+            if result is None:
+                pass  # wait_ci / wait_human 已在 _process_outcome 内等待
+            elif result[0] == "stop":
+                return self._finalize(*result[1:])
+            else:
+                next_reason = result
+
         try:
             while True:
                 if self.stop_event.is_set():
+                    self.rt.status = SupervisorStatus.STOPPING
+                    self._save_runtime()
                     return self._finalize(
                         StopReason.OPERATOR_STOP, SupervisorStatus.STOPPED_OPERATOR, 0
                     )
@@ -234,6 +263,39 @@ class SupervisorEngine:
         )
         return rc
 
+    async def _complete_interrupted_stop(self) -> int:
+        """上次收尾在 operator-stop 终止宽限期内崩溃（runtime 定格 STOPPING）：
+
+        本次启动**完成**那一次未被完成的 stop：杀掉仍在的 Parent 组 → STOPPED_OPERATOR，
+        绝不 spawn 新的 Parent。若当时还没拿到 pid（STARTING_PARENT 未 on_start），
+        通过 launcher 自写的 process.json（token 匹配）找回真身再杀组。
+        """
+        parent = self.rt.current_parent
+        pid, sid = None, None
+        activation_id = 0
+        if parent is not None:
+            activation_id = parent.activation_id
+            pid, sid = parent.pid, parent.process_start_id
+            if pid is None and parent.activation_token:
+                record = self._load_process_record(parent.activation_id)
+                if record is not None and record.get("activation_token") == parent.activation_token:
+                    pid = record.get("pid")
+                    sid = record.get("process_start_id")
+        if pid and (self._orphan_live(pid, sid) or process_group_alive(pid)):
+            from .dsh_runner import terminate_process_group
+
+            self.rt.status = SupervisorStatus.STOPPING
+            self._save_runtime()
+            await terminate_process_group(pid, self.config.limits.terminate_grace_seconds)
+            self.log.emit(
+                PARENT_KILLED,
+                activation=activation_id,
+                pid=pid,
+                reason=KillReason.OPERATOR_STOP.value,
+            )
+        self.rt.current_parent = None
+        return self._finalize(StopReason.OPERATOR_STOP, SupervisorStatus.STOPPED_OPERATOR, 0)
+
     def _restore_or_init_runtime(self) -> RuntimeState:
         existing = self.store.load()
         sid = read_start_id(os.getpid())
@@ -272,6 +334,8 @@ class SupervisorEngine:
                 existing.current_parent.activation_id if existing.current_parent else None
             ),
         )
+        # 若上次就是 STOPPING（operator-stop 收尾中崩溃）→ 本次启动要完成收尾，绝不 spawn
+        self._interrupted_stop = existing.status == SupervisorStatus.STOPPING
         existing.status = SupervisorStatus.BOOTING
         existing.supervisor_pid = os.getpid()
         existing.supervisor_process_start_id = sid
@@ -409,131 +473,246 @@ class SupervisorEngine:
         except Exception:
             return time.time() + timeout
 
-    async def _adopt_orphan_if_needed(self) -> None:
+    def _lease_free(self) -> bool:
+        """探测 parent.lock 租约是否空闲（不长时间持有）。
+
+        租约空闲 ⇔ 没有活着（未 exec / 已 exec 的 DSH）的旧 activation 持有它。
+        我们自己的 repo 独占锁排除了"另一个 Supervisor 正在并发 acquire"，
+        因此探测结果是可靠的。探测会临时获取再立即释放，无副作用。
+        """
+        if self.lease.held:
+            return False
+        if not self.lease.try_acquire():
+            return False
+        self.lease.release()
+        return True
+
+    def _record_valid(self, record, token):
+        """process.json 记录是否指向一个**活着且身份可信**的 DSH/launcher。"""
+        if record is None or record.get("activation_token") != token:
+            return None
+        rpid = record.get("pid")
+        rsid = record.get("process_start_id")
+        if not rpid or not rsid:
+            return None
+        if is_proc_alive(rpid) and identity_matches(rpid, rsid) and is_dsh_process(rpid):
+            return rpid
+        return None
+
+    async def _reconcile_starting_parent(self, parent: ParentInfo, token: str) -> Optional[Outcome]:
+        """STARTING_PARENT 恢复：先看 process.json，缺失则宽限等待。
+
+        返回非 None = 本次 bootstrap 已定案（孤儿自退/记录陈旧），
+        返回 None 且 current_parent 已清 = 放弃并允许重 spawn（租约空闲证明无旧进程），
+        返回 None 且 current_parent.pid 已填 = 进入收养循环。
+        """
+        record = self._load_process_record(parent.activation_id)
+        if record is not None:
+            rpid = self._record_valid(record, token)
+            if rpid is not None:
+                parent.pid = rpid
+                parent.process_start_id = record.get("process_start_id")
+                self.rt.status = SupervisorStatus.RUNNING_PARENT
+                self.log.emit(PARENT_RECONCILED, activation=parent.activation_id, pid=rpid)
+                self._save_runtime()
+                return None
+            # 记录存在但陈旧：清理残留组（仅当组长身份可验证）→ 保守 crash 恢复
+            await self._clean_recorded_group(record.get("pid"), record.get("process_start_id"))
+            self.log.emit(PARENT_RECORD_STALE, activation=parent.activation_id)
+            self.rt.current_parent = None
+            self._save_runtime()
+            return self._outcome_from_agent_state("RECOVER_AFTER_PARENT_CRASH")
+
+        # 记录缺失：有界宽限等 launcher 自写 process.json
+        grace = max(0.5, self.config.limits.terminate_grace_seconds)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            record = self._load_process_record(parent.activation_id)
+            rpid = self._record_valid(record, token)
+            if rpid is not None:
+                parent.pid = rpid
+                parent.process_start_id = record.get("process_start_id")
+                self.rt.status = SupervisorStatus.RUNNING_PARENT
+                self.log.emit(PARENT_RECONCILED, activation=parent.activation_id, pid=rpid)
+                self._save_runtime()
+                return None
+            await asyncio.sleep(0.05)
+
+        # 宽限已过、仍无记录：若租约被占（旧 launcher 还活着、只是还没写记录），
+        # **绝不 spawn** —— 继续等记录出现或租约释放（operator 可停止）；如文档定义。
+        if not self._lease_free():
+            self.log.emit(
+                PARENT_LEASE_HELD, activation=parent.activation_id, activation_token=token
+            )
+            while not self.stop_event.is_set():
+                record = self._load_process_record(parent.activation_id)
+                rpid = self._record_valid(record, token)
+                if rpid is not None:
+                    parent.pid = rpid
+                    parent.process_start_id = record.get("process_start_id")
+                    self.rt.status = SupervisorStatus.RUNNING_PARENT
+                    self.log.emit(PARENT_RECONCILED, activation=parent.activation_id, pid=rpid)
+                    self._save_runtime()
+                    return None
+                if self._lease_free():
+                    break
+                await asyncio.sleep(0.1)
+
+        # 租约空闲 = 旧 launcher/DSH 必死 → 安全放弃旧记录并允许重 spawn
+        self.log.emit(
+            PARENT_SPAWN_UNCONFIRMED,
+            activation=parent.activation_id,
+            activation_token=token,
+        )
+        self.rt.current_parent = None
+        self._save_runtime()
+        return None
+
+    def _outcome_from_agent_state(self, crash_reason: str) -> Optional[Outcome]:
+        """按 durable agent 状态分派孤儿消失后的下一步（P1）。"""
+        agent = self._read_agent_state_safe()
+        status = agent.status if agent else None
+        if status == AgentStatus.COMPLETED:
+            return Outcome(action="stop_success")
+        if status == AgentStatus.BLOCKED:
+            return Outcome(action="stop_blocked")
+        if status == AgentStatus.WAIT_HUMAN:
+            return Outcome(action="wait_human")
+        if status == AgentStatus.WAIT_CI:
+            return Outcome(action="wait_ci", agent=agent)
+        # 状态未知/RUNNING：退出方式未知 → 保守按 crash 恢复
+        return Outcome(action="restart", next_reason=crash_reason, backoff=True)
+
+    async def _clean_recorded_group(self, pid, start_id=None) -> None:
+        """记录的 leader 已死但组内还有成员（子进程）时，清理残留进程组。
+
+        安全约束（P0-2/“绝不错杀”）：只有组长身份仍**可验证**（leader 还在，
+        哪怕已僵尸——starttime 仍可从 /proc 读到）才允许按 pgid 杀组；
+        leader 已完全消失时组内残留可能是 PID 复用后的无关会话组，
+        **绝不**按裸 pid 冒险杀组，宁可留给 operator。
+        """
+        if not pid or not process_group_alive(pid):
+            return
+        if start_id is not None and not identity_matches(pid, start_id):
+            return  # 组长身份无法确认 → 不按裸 pid 杀组
+        from .dsh_runner import terminate_process_group
+
+        self.log.emit(
+            PARENT_KILLED, activation=0, pid=pid, reason=KillReason.STALE_GROUP_CLEANUP.value
+        )
+        await terminate_process_group(pid, self.config.limits.terminate_grace_seconds)
+
+    def _orphan_live(self, pid, sid) -> bool:
+        return bool(pid) and is_proc_alive(pid) and identity_matches(pid, sid) and is_dsh_process(pid)
+
+    async def _adopt_orphan_if_needed(self) -> Optional[Outcome]:
         parent = self.rt.current_parent
         if parent is None:
-            return
+            return None
         pid = parent.pid
         sid = parent.process_start_id
         token = parent.activation_token
 
-        # STARTING_PARENT：spawn 结果未知 → 通过 process.json reconciliation
+        # STARTING_PARENT：spawn 结果未知 → process.json reconciliation
         if pid is None:
-            record = self._load_process_record(parent.activation_id)
-            if record is not None and record.get("activation_token") == token:
-                rpid = record.get("pid")
-                rsid = record.get("process_start_id")
-                if (
-                    rpid
-                    and rsid
-                    and is_proc_alive(rpid)
-                    and identity_matches(rpid, rsid)
-                    and is_dsh_process(rpid)
-                ):
-                    pid, sid = rpid, rsid
-                    parent.pid = pid
-                    parent.process_start_id = sid
-                    self.rt.status = SupervisorStatus.RUNNING_PARENT
-                    self.log.emit(PARENT_RECONCILED, activation=parent.activation_id, pid=pid)
-                    self._save_runtime()
-                else:
-                    self.log.emit(PARENT_RECORD_STALE, activation=parent.activation_id)
-                    self.rt.current_parent = None
-                    self._save_runtime()
-                    return
-            else:
-                grace = max(0.5, self.config.limits.terminate_grace_seconds)
-                deadline = time.monotonic() + grace
-                reconciled = False
-                while time.monotonic() < deadline and not self.stop_event.is_set():
-                    record = self._load_process_record(parent.activation_id)
-                    if record is not None and record.get("activation_token") == token:
-                        rpid = record.get("pid")
-                        rsid = record.get("process_start_id")
-                        if (
-                            rpid
-                            and rsid
-                            and is_proc_alive(rpid)
-                            and identity_matches(rpid, rsid)
-                            and is_dsh_process(rpid)
-                        ):
-                            pid, sid = rpid, rsid
-                            parent.pid = pid
-                            parent.process_start_id = sid
-                            self.rt.status = SupervisorStatus.RUNNING_PARENT
-                            self.log.emit(PARENT_RECONCILED, activation=parent.activation_id, pid=pid)
-                            self._save_runtime()
-                            reconciled = True
-                            break
-                    await asyncio.sleep(0.05)
-                if not reconciled:
-                    self.log.emit(
-                        PARENT_SPAWN_UNCONFIRMED,
-                        activation=parent.activation_id,
-                        activation_token=token,
-                    )
-                    self.rt.current_parent = None
-                    self._save_runtime()
-                    return
-            # 已确认的孤儿，落入下方收养循环
+            outcome = await self._reconcile_starting_parent(parent, token)
+            if outcome is not None:
+                return outcome
+            if self.rt.current_parent is None:
+                return None  # 放弃重 spawn
+            pid = parent.pid
+            sid = parent.process_start_id
+            if pid is None:
+                return None  # 防御
+
         # RUNNING_PARENT 完整判定（含 cmdline）
-        if not (is_proc_alive(pid) and identity_matches(pid, sid) and is_dsh_process(pid)):
+        if not self._orphan_live(pid, sid):
+            # 记录的 leader 死了：若组里还有成员（被遗弃的子进程），先清组
+            await self._clean_recorded_group(pid, sid)
             self.rt.counters.parent_activations = max(
                 self.rt.counters.parent_activations, parent.activation_id
             )
             self.rt.current_parent = None
             self._save_runtime()
-            return
+            return self._outcome_from_agent_state("RECOVER_AFTER_PARENT_CRASH")
 
         self.log.emit(ORPHAN_ADOPTED, activation=parent.activation_id, pid=pid)
         deadline = self._adoption_deadline(parent)
-        killed_by = None
+        killed_by: Optional[KillReason] = None
         while True:
-            alive = is_proc_alive(pid) and identity_matches(pid, sid) and is_dsh_process(pid)
-            if not alive:
+            if not self._orphan_live(pid, sid):
                 break
             if self.stop_event.is_set():
+                self.rt.status = SupervisorStatus.STOPPING
+                self._save_runtime()
                 from .dsh_runner import terminate_process_group
 
                 await terminate_process_group(pid, self.config.limits.terminate_grace_seconds)
-                killed_by = StopReason.OPERATOR_STOP
+                killed_by = KillReason.OPERATOR_STOP
                 break
             self._accrue_budget()
             if (self.rt.active_budget or {}).get("accrued_seconds", 0.0) >= self.config.limits.max_active_wall_seconds:
                 from .dsh_runner import terminate_process_group
 
                 await terminate_process_group(pid, self.config.limits.terminate_grace_seconds)
-                killed_by = StopReason.MAX_ACTIVE_WALL_TIME
+                killed_by = KillReason.MAX_ACTIVE_WALL_TIME
                 break
             if time.time() >= deadline:
                 from .dsh_runner import terminate_process_group
 
                 await terminate_process_group(pid, self.config.limits.terminate_grace_seconds)
-                killed_by = StopReason.MAX_TIMEOUTS
+                killed_by = KillReason.PARENT_TIMEOUT
                 break
             await asyncio.sleep(0.2)
 
-        if killed_by == StopReason.OPERATOR_STOP:
-            self.log.emit(PARENT_KILLED, activation=parent.activation_id, pid=pid, reason="OPERATOR_STOP")
-        elif killed_by == StopReason.MAX_TIMEOUTS:
-            self.rt.counters.timeouts += 1
-            self.log.emit(PARENT_TIMEOUT, activation=parent.activation_id, pid=pid)
-            self.log.emit(PARENT_KILLED, activation=parent.activation_id, pid=pid, reason="PARENT_TIMEOUT")
-        elif killed_by == StopReason.MAX_ACTIVE_WALL_TIME:
-            self.log.emit(PARENT_KILLED, activation=parent.activation_id, pid=pid, reason="MAX_ACTIVE_WALL_TIME")
-        else:
-            self.log.emit(ORPHAN_EXITED, pid=pid, activation=parent.activation_id)
-
+        # —— 收尾：清当前 Parent 记录 ——
         self.rt.counters.parent_activations = max(
             self.rt.counters.parent_activations, parent.activation_id
         )
         self.rt.current_parent = None
         self._save_runtime()
 
+        if killed_by == KillReason.OPERATOR_STOP:
+            self.log.emit(PARENT_KILLED, activation=parent.activation_id, pid=pid, reason=KillReason.OPERATOR_STOP.value)
+            return None
+        if killed_by == KillReason.PARENT_TIMEOUT:
+            self.rt.counters.timeouts += 1
+            self.log.emit(PARENT_TIMEOUT, activation=parent.activation_id, pid=pid)
+            self.log.emit(PARENT_KILLED, activation=parent.activation_id, pid=pid, reason=KillReason.PARENT_TIMEOUT.value)
+            self._save_runtime()
+            # 与普通激活超时一致：timeouts+1 + 退避 + RECOVER_AFTER_PARENT_TIMEOUT
+            return self._outcome_from_agent_state("RECOVER_AFTER_PARENT_TIMEOUT")
+        if killed_by == KillReason.MAX_ACTIVE_WALL_TIME:
+            # 主循环 enforce_limits 会以 MAX_ACTIVE_WALL_TIME 收场
+            self.log.emit(PARENT_KILLED, activation=parent.activation_id, pid=pid, reason=KillReason.MAX_ACTIVE_WALL_TIME.value)
+            return None
+        # orphan 自己退出、退出方式未知
+        self.log.emit(ORPHAN_EXITED, pid=pid, activation=parent.activation_id)
+        return self._outcome_from_agent_state("RECOVER_AFTER_PARENT_CRASH")
+
     async def _activation_cycle(self, reason: str) -> Optional[Outcome]:
+        try:
+            return await self._activation_cycle_inner(reason)
+        finally:
+            # 本轮激活已定案（Parent 确定退出或被取消后的整组终止完成）→ 释放租约
+            self.lease.release()
+
+    def _ensure_lease(self) -> bool:
+        """确保引擎持有 Parent 租约；被他人持有时返回 False（绝不无租约 spawn）。"""
+        return self.lease.held or self.lease.try_acquire()
+
+    async def _activation_cycle_inner(self, reason: str) -> Optional[Outcome]:
         limit = self._enforce_limits()
         if limit is not None:
             return Outcome(action="stop_limit", limit_reason=limit)
+
+        # P0-1：拿不到 Parent lease = 存在活着的旧 activation → 绝不 spawn 第二个
+        if not self._ensure_lease():
+            self.log.emit(PARENT_LEASE_HELD, reason=reason)
+            while not self._ensure_lease():
+                if self.stop_event.is_set():
+                    return None
+                await asyncio.sleep(0.2)
 
         activation_id = self.rt.counters.parent_activations + 1
         token = uuid.uuid4().hex
@@ -581,6 +760,7 @@ class SupervisorEngine:
                 run_dir=run_dir,
                 on_start=on_start,
                 activation_token=token,
+                lease_fd=self.lease.fd if self.lease.held else None,
             )
         )
         stop_task = asyncio.ensure_future(self.stop_event.wait())
@@ -589,6 +769,9 @@ class SupervisorEngine:
             {run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
         )
         if run_task not in done:
+            # operator stop：STOPPING 先落盘（终止宽限期内崩溃也可恢复），再整组终止
+            self.rt.status = SupervisorStatus.STOPPING
+            self._save_runtime()
             stop_task.cancel()
             run_task.cancel()
             try:

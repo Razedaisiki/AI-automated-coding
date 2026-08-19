@@ -1,3 +1,13 @@
+[project]
+name = "dsh-supervisor"
+version = "0.1.0"
+description = "Autonomous development supervisor for DSH Parent Agents"
+requires-python = ">=3.8"
+dependencies = [
+    # Python 3.11+ 用标准库 tomllib；3.8–3.10 需要 tomli
+    "tomli>=2.0; python_version < '3.11'",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

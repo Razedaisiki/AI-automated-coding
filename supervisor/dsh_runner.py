@@ -4,7 +4,10 @@
   launcher 在 exec DSH 前原子写 .supervisor/runs/activation-N/process.json（pid/start_id/token）。
   即使 Supervisor 在 spawn 与 on_start 之间被 kill -9，子进程身份仍在磁盘上。
 - 为进程创建独立 session/process group（start_new_session=True）
-- 超时：SIGTERM 进程组 → grace → SIGKILL 进程组
+- Parent lease（P0-1）：Supervisor 已 flock 的 `.supervisor/parent.lock` FD 通过
+  pass_fds 传给 launcher → exec 后由 DSH 继承持有；唯一性由租约保证，process.json 只做身份发现。
+- 超时：SIGTERM 进程组 → grace → SIGKILL 进程组，并**确认整个 PGID 消失**
+  （P0-2：只看 leader PID 会漏掉忽略 SIGTERM 的子进程）。
 - 产出 ParentResult；127+stderr 标记视为 RunnerError（清晰报错）
 """
 
@@ -17,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import ParentResult
-from .process_identity import read_start_id
+from .process_identity import process_group_alive, read_start_id
 
 _LAUNCHER = Path(__file__).resolve().parent / "launcher.py"
 
@@ -38,24 +41,32 @@ def _kill_group(pid: int, sig: signal.Signals) -> None:
 
 
 async def terminate_process_group(pid: int, grace_seconds: float) -> None:
-    """通用进程组终止（供 engine 在收养等路径复用）：SIGTERM→轮询 grace→SIGKILL。"""
-    from .process_identity import is_proc_alive
+    """通用进程组终止（供 engine 在收养等路径复用）：
 
+    SIGTERM 整组 → 轮询到 **整个 PGID 消失**（`process_group_alive` 判据，
+    僵尸不算活着）→ 宽限后仍有成员则 SIGKILL 整组 → 确认 PGID 消失。
+    绝不只检查 leader PID（leader 死了但子进程忽略 SIGTERM 也必须被清）。
+    """
+    import time as _time
+    import asyncio as _asyncio
+
+    if not pid:
+        return
     _kill_group(pid, signal.SIGTERM)
-    deadline = __import__("time").monotonic() + max(0, grace_seconds)
-    while __import__("time").monotonic() < deadline:
-        if not is_proc_alive(pid):
+    deadline = _time.monotonic() + max(0, grace_seconds)
+    while _time.monotonic() < deadline:
+        if not process_group_alive(pid):
             return
-        await __import__("asyncio").sleep(0.05)
-    if not is_proc_alive(pid):
+        await _asyncio.sleep(0.05)
+    if not process_group_alive(pid):
         return
     _kill_group(pid, signal.SIGKILL)
-    # SIGKILL 后再给一点时间让内核回收
-    deadline = __import__("time").monotonic() + 1.0
-    while __import__("time").monotonic() < deadline:
-        if not is_proc_alive(pid):
+    # SIGKILL 后再给一点时间让内核/init 回收，确认整组消失
+    deadline = _time.monotonic() + 2.0
+    while _time.monotonic() < deadline:
+        if not process_group_alive(pid):
             return
-        await __import__("asyncio").sleep(0.05)
+        await _asyncio.sleep(0.05)
 
 
 class DshRunner:
@@ -74,6 +85,7 @@ class DshRunner:
         run_dir,
         on_start=None,
         activation_token=None,
+        lease_fd=None,
     ) -> ParentResult:
         repo = Path(repo)
         run_dir = Path(run_dir)
@@ -95,6 +107,8 @@ class DshRunner:
         env = dict(os.environ)
         env["SUPERVISOR_ACTIVATION_ID"] = str(activation_id)
         env["SUPERVISOR_ACTIVATION_TOKEN"] = token
+        if lease_fd is not None:
+            env["SUPERVISOR_PARENT_LOCK_FD"] = str(lease_fd)
         cmd = [
             sys.executable,
             str(_LAUNCHER),
@@ -110,15 +124,18 @@ class DshRunner:
             prompt,
         ]
         env["SUPERVISOR_RUN_DIR"] = str(run_dir)
+        spawn_kwargs = dict(
+            cwd=str(repo),
+            stdout=out_f,
+            stderr=err_f,
+            start_new_session=True,
+            env=env,
+        )
+        if lease_fd is not None:
+            # 把已 flock 的租约 FD 交给 launcher（exec DSH 后继续持有 = 唯一性保证）
+            spawn_kwargs["pass_fds"] = (lease_fd,)
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(repo),
-                stdout=out_f,
-                stderr=err_f,
-                start_new_session=True,
-                env=env,
-            )
+            proc = await asyncio.create_subprocess_exec(*cmd, **spawn_kwargs)
         except FileNotFoundError as exc:
             out_f.close()
             err_f.close()
@@ -171,12 +188,32 @@ class DshRunner:
         )
 
     async def _terminate_group(self, proc) -> None:
-        _kill_group(proc.pid, signal.SIGTERM)
+        """SIGTERM 整组 → 等 leader 回收/宽限 → 还有成员则 SIGKILL → 确认 PGID 消失。"""
+        import time as _time
+
+        pgid = proc.pid
+        grace_dl = _time.monotonic() + max(0, self.terminate_grace_seconds)
+        _kill_group(pgid, signal.SIGTERM)
         try:
             await asyncio.wait_for(proc.wait(), timeout=self.terminate_grace_seconds)
         except asyncio.TimeoutError:
-            _kill_group(proc.pid, signal.SIGKILL)
-            await proc.wait()
+            # leader 不配合（忽略 SIGTERM）：grace 一到立即 escalate
+            _kill_group(pgid, signal.SIGKILL)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+        if not process_group_alive(pgid):
+            return  # 整组已清（快路径）
+        # leader 已退出但组内还有成员（如忽略 SIGTERM 的子进程）：把剩余 grace 给它们，
+        # 到点仍不退出就 SIGKILL，并最终确认整个 PGID 消失
+        while _time.monotonic() < grace_dl and process_group_alive(pgid):
+            await asyncio.sleep(0.05)
+        if process_group_alive(pgid):
+            _kill_group(pgid, signal.SIGKILL)
+            dl2 = _time.monotonic() + 2.0
+            while _time.monotonic() < dl2 and process_group_alive(pgid):
+                await asyncio.sleep(0.05)
 
     @staticmethod
     def _kill_group(pid: int, sig: signal.Signals) -> None:

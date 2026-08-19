@@ -1,5 +1,10 @@
 对。现在可以把目标收敛得非常清楚：
 
+> **历史设计文档（archived design）**：本文档是 M0–M5 阶段的设计稿，保留作
+> 追溯。当前规范性协议以 `docs/supervisor-protocol.md` 为准；文中出现的文件名
+> 细节（如小写 `.agent/plan.md`）以现行代码/协议（`.agent/PLAN.md`）为准，
+> 不再逐处改写。
+
 > **Supervisor 是一个确定性的进程管理器。它不负责开发，只负责保证 Parent Agent 能持续、安全、可恢复地工作。**
 
 而且你当前 DSH 的 `headless` 模式非常适合这个架构：它会创建一个新的持久化 Agent，把任务作为普通用户消息提交，等待这一轮完全结束，然后 flush Session、输出最终 assistant 文本并退出；它没有交互式后续输入接口。

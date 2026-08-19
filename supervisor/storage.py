@@ -100,6 +100,12 @@ class Layout:
         return self.supervisor_dir / "lock"
 
     @property
+    def parent_lock_path(self) -> Path:
+        """Parent 唯一性租约（P0-1）：Supervisor spawn 前 flock，
+        launcher→exec 后的 DSH 继承持有；重启的 Supervisor 拿不到锁就不许 spawn。"""
+        return self.supervisor_dir / "parent.lock"
+
+    @property
     def resume_path(self) -> Path:
         return self.supervisor_dir / "resume.json"
 

@@ -44,7 +44,8 @@ Supervisor 只用只读探测：`rev-parse`、`symbolic-ref`、`status --porcela
 | `.agent/STATE.md` | Parent | Parent | Parent 自己的文档工作流 |
 | `.supervisor/runtime.json` | **Supervisor** | Supervisor | 自动化系统运行到哪了 |
 | `.supervisor/events.jsonl` | Supervisor | 任何人 | 只追加的事件日志 |
-| `.supervisor/lock` | Supervisor | Supervisor | 独占锁 |
+| `.supervisor/lock` | Supervisor | Supervisor | 独占锁（Supervisor 唯一性） |
+| `.supervisor/parent.lock` | Supervisor | Supervisor | **Parent 唯一性租约**（flock；由 launcher→exec 后的 DSH 继承持有） |
 | `.supervisor/runs/activation-NNNNNN/` | Supervisor | 任何人 | 每轮 Parent 的运行审计目录 |
 | `.supervisor/inbox/` | Supervisor | Parent | 交给 Parent 的资料（如 CI failed 材料） |
 | `supervisor.toml` | 人 / `supervisor init` | Supervisor | 配置 |
@@ -119,7 +120,8 @@ RUNNING_PARENT    Parent 运行中
 RESTART_BACKOFF   崩溃后退避等待
 WAITING_CI        等待 CI（M7+）
 WAITING_HUMAN     等待人工（M8+）
-STOPPING          收到停止请求，正在收尾
+STOPPING          收到停止请求，正在收尾（终止宽限期内落盘；过程中崩溃、
+                  重启后完成收尾，见 §12）
 STOPPED_SUCCESS   成功完成（TASK_COMPLETED）
 STOPPED_BLOCKED   Parent 声明 BLOCKED
 STOPPED_LIMIT     触发硬限额
@@ -282,13 +284,27 @@ INVALID_AGENT_STATE | SUPERVISOR_INTERNAL_ERROR | OPERATOR_STOP
 
 ## 12. 进程生命周期
 
-- Parent 必须独立 process group（`start_new_session=True`）。
+- Parent 必须独立 process group（`start_new_session=True`），且进程组组长即
+  Parent 本体。
 - 超时：`SIGTERM` 进程组 → 等待 `terminate_grace_seconds`（默认 10s）→ 仍不退
-  出则 `SIGKILL` 进程组。
+  出则 `SIGKILL` 进程组 → **确认整个 PGID 消失**（`os.killpg(pgid, 0)` 抛
+  `ProcessLookupError`，或 /proc 扫描只剩僵尸）。绝不只检查 leader PID：
+  leader 死了但忽略 SIGTERM 的子进程/子 agent 也必须在同一轮被清。
+- **Parent 唯一性租约（Parent lease）**：Supervisor 在每次 spawn 前
+  `flock` `.supervisor/parent.lock`，并把已锁 FD 通过 `pass_fds` +
+  `SUPERVISOR_PARENT_LOCK_FD` 传给 launcher；`os.execvp` 不关闭该 FD，
+  因此 exec 后的 DSH 进程继续持有租约。DSH 死亡时内核关闭 FD，flock 自动释放。
+  作用分工：`process.json` = **身份发现**（pid/starttime/token）；
+  `parent.lock` 租约 = **唯一性保证**。重启的 Supervisor 拿不到租约 =
+  存在活着的旧 activation = **绝不 spawn 第二个 Parent**（等记录出现 /
+  等租约释放 / 等 operator stop）。
 - Supervisor 只在 `dsh` 与只读 `git`/CI 工具之间受限启动程序；**绝不**
   `shell=True` 执行任意字符串。
-- Supervisor 收到 SIGINT/SIGTERM：`STOPPING` → SIGTERM Parent 进程组 → grace →
-  SIGKILL → `STOPPED_OPERATOR` → 释放锁。不把 Parent 悄悄留后台。
+- Supervisor 收到 SIGINT/SIGTERM：runtime 置 `STOPPING` 并落盘 → SIGTERM
+  Parent 进程组 → grace → SIGKILL → 确认 PGID 消失 → `STOPPED_OPERATOR` →
+  释放锁。不把 Parent 悄悄留后台。若 Supervisor 在终止宽限期内崩溃：重启后
+  看到 runtime 定格 `STOPPING`，**完成那次未完成的 stop**（杀组 →
+  `STOPPED_OPERATOR`），绝不 spawn。
 
 ---
 
@@ -298,26 +314,46 @@ Supervisor 重启时三态恢复（`NO_PARENT` / `STARTING_PARENT` / `RUNNING_PA
 
 ```
 BOOT → 拿独占锁 → 读 runtime.json → 读 .agent/state.json
+     → 若 runtime 定格 STOPPING（上次 operator-stop 收尾中崩溃）
+         完成收尾：杀仍在的 Parent 组（pid 未知时经 process.json 找回）→ STOPPED_OPERATOR
      → 若状态为 STARTING_PARENT（pid 未知）：
          读 .supervisor/runs/activation-N/process.json
          token 一致 + pid 存在 + starttime 一致 + cmdline 仍是 DSH/launcher
            → 收养孤儿（PARENT_RECONCILED）
-         记录缺失 → 宽限等待；仍无则重新 spawn（PARENT_SPAWN_UNCONFIRMED）
+         记录缺失 → 宽限等待：
+           仍无记录但 parent.lock 租约空闲（旧 launcher/DSH 必死）
+             → 重新 spawn（PARENT_SPAWN_UNCONFIRMED）
+           租约仍被占用（旧 launcher 活着、还没写记录）
+             → 绝不 spawn，继续等记录/等租约释放（PARENT_LEASE_HELD）
      → 若状态为 RUNNING_PARENT：
          PID 存在 + starttime 一致 + cmdline 仍是 DSH/launcher
-           → orphan 收养：不启动第二个 Parent，轮询 /proc 等其退出
-           收养期间：stop 到来→杀进程组；parent timeout / wall-time 继续生效
-         PID 不存在 / 身份不一致 → 上一轮进程已死，按状态继续
+           → orphan 收养：不启动第二个 Parent，轮询直到整组消失
+           收养期间：stop 到来→STOPPING 落盘→杀整组(PGID)；
+           parent timeout / wall-time 继续生效
+         PID 不存在 / 身份不一致 → 上一轮进程已死：若进程组还有残留成员先清组，
+           按状态继续（见下"orphan 消失后的策略"）
 ```
 
 防线：
 
 - PID 复用：`pid + starttime + cmdline(contains dsh/launcher)` 三重校验。
 - `supervisor stop`：`supervisor_pid + supervisor_process_start_id` 双重校验。
-- `supervisor/` 启动的真实 DSH 子进程由 `supervisor/launcher.py` 自写 `process.json`
- （exec 前原子写），消除 `spawn → persist PID` 微窗口的重复 Parent 风险。
+- **Parent lease**：`.supervisor/parent.lock` flock 由 launcher→exec 后的 DSH
+  继承持有；`process.json` 负责身份发现，`parent.lock` 负责唯一性 —— 拿不到租约
+  绝不 spawn 第二个 Parent，从根上封死 `spawn → child writes process.json` 窗口。
+- 整组终止：SIGTERM→grace→SIGKILL 后确认**整个 PGID 消失**（含忽略 SIGTERM 的
+  子进程），而不是只看 leader PID。
 - 事件拆分：`PARENT_STARTING`（意图持久化，含 token）→ `PARENT_STARTED`（确认，
   含 pid/process_start_id），便于审计与恢复回放。
+
+**orphan 消失后的策略**（退出方式未知，按 durable agent 状态分派）：
+
+| 状态 | 下一轮 |
+|---|---|
+| `COMPLETED` / `BLOCKED` / `WAIT_HUMAN` / `WAIT_CI` | 按状态分派（stop / wait） |
+| `RUNNING` 或状态缺失 | **保守** `RECOVER_AFTER_PARENT_CRASH` + 退避（不是 `CONTINUE`） |
+| 收养期 parent timeout | `timeouts += 1` + 退避 + `RECOVER_AFTER_PARENT_TIMEOUT` |
+| 收养期 wall-time | 杀组，主循环以 `MAX_ACTIVE_WALL_TIME` 收场 |
 
 ---
 

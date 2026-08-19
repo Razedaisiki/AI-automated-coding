@@ -82,3 +82,39 @@ def is_dsh_process(pid: int) -> bool:
     if looks_like_dsh_cmdline(cmdline):
         return True
     return "launcher" in cmdline
+
+
+def process_group_alive(pgid: int) -> bool:
+    """PGID 是否还有**非僵尸**成员（P0-2 整组终止的判定依据）。
+
+    `os.killpg(pgid, 0)` 只证明"组里至少还有一个进程"——僵尸也算，直到被
+    reap。而僵尸不持有 FD、不能执行任何代码，对"进程组是否还在干活"无意义。
+    因此：先看 killpg 是否成功；若组里只剩僵尸，扫描 /proc 后返回 False。
+    """
+    pgid = int(pgid)
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    # 组还存在：扫描 /proc，找同组且非僵尸（state != 'Z'）的成员
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return True  # 无法读 /proc → 保守视为存活
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            stat = (_PROC / entry / "stat").read_text(encoding="utf-8", errors="replace")
+            after = stat[stat.rindex(")") + 2 :]
+            fields = after.split()
+            # fields[0]=state, fields[1]=ppid, fields[2]=pgrp
+            if len(fields) > 2 and fields[2] == str(pgid) and fields[0] != "Z":
+                return True
+        except (OSError, ValueError, IndexError):
+            continue
+    return False

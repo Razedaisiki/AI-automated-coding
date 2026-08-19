@@ -1,5 +1,10 @@
 # Delivery report — Supervisor M0–M5 (@ /home/co1718/dsh-test)
 
+> **Historical pre-hardening delivery report.** This report describes the state
+> after the first M5 review round (71 passed, 5 commits). It is kept for
+> provenance only — current numbers, design decisions and acceptance evidence
+> live in `.agent/FINAL_REPORT.md` and `docs/supervisor-protocol.md`.
+
 Tool verdict: **green**（doublecheck_report 自动聚合；本会话验证维度在工具侧未执行，
 以本文件中的实测证据为准；会话内已做对抗式自查并修复。）
 

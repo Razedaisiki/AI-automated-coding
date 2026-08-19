@@ -15,6 +15,7 @@ Behaves per env vars so DshRunner/engine tests can script Parent behavior:
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 
@@ -68,6 +69,24 @@ def main():
     if mode == "ignore_term_and_hang":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         _maybe_write_state()
+        while True:
+            time.sleep(0.5)
+
+    if mode == "hang_with_ignoring_child":
+        # leader 本身接收默认 SIGTERM（会退出），但同一进程组里有一个忽略 SIGTERM 的子进程
+        if os.environ.get("FAKE_DSH_ROLE") == "child":
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            while True:
+                time.sleep(0.5)
+        _maybe_write_state()
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "child"],
+            env=dict(
+                os.environ,
+                FAKE_DSH_ROLE="child",
+                FAKE_DSH_MODE="hang_with_ignoring_child",
+            ),
+        )  # 不创建新 session：子进程留在 leader 的进程组里
         while True:
             time.sleep(0.5)
 
