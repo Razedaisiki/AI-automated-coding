@@ -3,7 +3,8 @@
 ## 任务
 
 按 `AI_automated_coding.md` 实施 Supervisor（确定性进程管理器）M0–M5 hardening，
-并落实两轮评审意见（第二轮：Parent lease、整组终止、收养恢复语义、STOPPING、文档同步）。
+并落实三轮评审意见（第二轮：Parent lease、整组终止、收养恢复语义、STOPPING；
+第三轮：STOPPING 二次崩溃安全、lease-aware stop 收尾、终止失败必须失败收场）。
 
 ## 交付内容
 
@@ -15,7 +16,8 @@
 | M3 | `engine.py` 本地主循环：INITIAL_START / RUNNING / COMPLETED / BLOCKED 分发，重启策略 | 完成 |
 | M4 | 限额（activations/crash/clean/timeouts/active wall time）→ STOPPED_LIMIT、退避、事件审计 | 完成 |
 | M5 hardening R1 | 三态恢复 + process.json reconciliation + 收养期限额/超时 + supervisor 身份校验 + 文件/事件统一 | 完成 |
-| M5 hardening R2 | **Parent lease** + **整组终止（PGID 确认）** + 收养恢复语义 + **STOPPING** + 文档/依赖声明 | 完成 |
+| M5 hardening R2 | Parent lease + 整组终止（PGID 确认）+ 收养恢复语义 + STOPPING + 文档/依赖声明 | 完成 |
+| M5 hardening R3 | **durable STOPPING** + **lease-aware stop 收尾** + **终止失败失败收场** + **PGID 击杀身份可验证** | 完成 |
 | CLI | `python -m supervisor {init,run,parent-once,status,events,stop,resume}` | 完成 |
 
 ## 关键设计落地
@@ -26,20 +28,22 @@
 - **Parent lease（唯一性）**：Supervisor spawn 前 `flock` `.supervisor/parent.lock`，
   把已锁 FD 经 `pass_fds`/`SUPERVISOR_PARENT_LOCK_FD` 交给 launcher → `os.execvp`
   后续由 DSH 继承持有；DSH 死亡时内核关 FD 自动释放。拿不到租约 = 存在活着的旧
-  activation → **绝不 spawn 第二个 Parent**。`process.json` 只负责身份发现
-  （pid/starttime/token），`parent.lock` 负责唯一性 —— 二者分工封死
-  `spawn → child writes process.json` 窗口。
+  activation → **绝不 spawn 第二个 Parent**。`process.json` 只负责身份发现。
 - **整组终止（P0-2）**：`process_group_alive`（killpg + /proc 排除僵尸）为判据；
-  SIGTERM 整组 → grace → SIGKILL → **确认整个 PGID 消失**，忽略 SIGTERM 的子进程
-  也必须在同一轮被清，绝不只看 leader PID。
+  SIGTERM 整组 → grace → SIGKILL → **确认整个 PGID 消失**；确认失败 → 显式失败
+  （返回 bool），Supervisor 转 `STOPPED_ERROR`，绝不写 `STOPPED_OPERATOR`。
 - 收养恢复语义（P1）：收养期 parent timeout → `timeouts += 1` + 退避 +
   `RECOVER_AFTER_PARENT_TIMEOUT`；orphan 自退且状态未知 → 保守
-  `RECOVER_AFTER_PARENT_CRASH`；内部 kill 原因用 `KillReason`
-  （OPERATOR_STOP/PARENT_TIMEOUT/MAX_ACTIVE_WALL_TIME/STALE_GROUP_CLEANUP），
-  不复用终态 `StopReason`。
-- **STOPPING（P2）**：operator-stop 收尾（终止宽限期）期间 runtime 落盘
-  `STOPPING`；在此窗口崩溃后重启，Supervisor 完成那次未完成的 stop
-  （pid 未知时经 process.json 找回真身杀组）→ `STOPPED_OPERATOR`，绝不 spawn。
+  `RECOVER_AFTER_PARENT_CRASH`；内部 kill 原因用 `KillReason`，不复用终态
+  `StopReason`。
+- **STOPPING 二次崩溃安全（R3 P0）**：runtime 恢复 STOPPING 时**磁盘继续保持
+  STOPPING**（不复位 BOOTING）直到真正 `STOPPED_OPERATOR`——无论重启多少次都不
+  丢 stop intent。stop 收尾是 lease-aware 的：pid 已验证→杀组；pid 未知→轮询
+  process.json（token 匹配）→杀组；无可信身份→lease 空闲才完成 / 被占则继续等
+  （绝不结束 stop 把 Parent 留后台）。reconcile 等 lease 时收到 stop → 切入
+  STOPPING，不落 PARENT_SPAWN_UNCONFIRMED。
+- **PGID 击杀身份可验证（R3 P1）**：`start_id` 缺失/不符 → 不按裸 pid 杀组
+  （PID 复用风险），宁可无法自动清理。
 - PARENT_STARTING（意图，含 token）→ PARENT_STARTED（确认，含 pid/start_id）审计拆分。
 - `supervisor stop`：`supervisor_pid + supervisor_process_start_id` 双重校验。
 - 运行依赖：Python 3.8+；3.8–3.10 用 `tomli`（`pyproject.toml` 已声明），3.11+
@@ -47,12 +51,10 @@
 
 ## 测试
 
-`python -m pytest -q` → **86 passed**
+`python -m pytest -q` → **93 passed**
 
-- M1 25 / M2 7 / M3–M5 引擎 21 / CLI 12 / Git 探针 3 / 对抗 3 / hardening R1 7
-- hardening R2 8：Parent lease（占用禁 spawn→释放后重 spawn；FD 继承+自动释放）、
-  整组终止（忽略 SIGTERM 子进程被清）、收养 timeout 语义、orphan 自退语义、
-  STOPPING 落盘 + 崩溃恢复完成收尾（含 STARTING pid 未知经记录找回）
+- M1 25 / M2 7 / M3–M5 引擎 21 / CLI 12 / Git 探针 3 / 对抗 3 / hardening R1 7 /
+  hardening R2 8 / stopping-consistency R3 6
 
 ## 端到端验收（自动化）
 
@@ -60,9 +62,12 @@
 2. 杀 Supervisor（kill -9）→ 重启经 process.json+token+pid/starttime+cmdline 收养，
    无重复 Parent；孤儿退出后继续。
 3. lease 被占用 → 重启绝不 spawn（PARENT_LEASE_HELD）；租约释放后才重 spawn。
-4. 收养期 parent timeout / wall-time → 杀整组、计数、正确恢复语义/STOPPED_LIMIT。
-5. operator-stop 收尾期间 STOPPING 落盘；STOPPING 崩溃重启完成收尾，绝不 spawn。
-6. `supervisor stop` 错身份/缺失身份 → rc=1 不动目标进程；双 Supervisor 并发 rc=2 拒绝。
+4. STOPPING 恢复 durable（磁盘保持 STOPPING）；STOPPING+pid 未知+lease held →
+   等 record 杀组后才 STOPPED_OPERATOR；绝不把 Parent 留后台。
+5. reconcile 等 lease 中 stop → 切入 STOPPING（无 PARENT_SPAWN_UNCONFIRMED）。
+6. 终止失败 / 取消路径进程组仍 alive → STOPPED_ERROR（SUPERVISOR_INTERNAL_ERROR）。
+7. 收养期 parent timeout / wall-time → 杀整组、计数、正确恢复语义/STOPPED_LIMIT。
+8. `supervisor stop` 错身份/缺失身份 → rc=1 不动目标进程；双 Supervisor 并发 rc=2 拒绝。
 
 ## 环境限制
 

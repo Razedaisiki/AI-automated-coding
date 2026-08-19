@@ -336,6 +336,7 @@ class ParentResult:
     reason: str = ""
     pid: Optional[int] = None
     process_start_id: Optional[str] = None
+    group_survived: bool = False
 
 
 @dataclass

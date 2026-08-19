@@ -302,9 +302,21 @@ INVALID_AGENT_STATE | SUPERVISOR_INTERNAL_ERROR | OPERATOR_STOP
   `shell=True` 执行任意字符串。
 - Supervisor 收到 SIGINT/SIGTERM：runtime 置 `STOPPING` 并落盘 → SIGTERM
   Parent 进程组 → grace → SIGKILL → 确认 PGID 消失 → `STOPPED_OPERATOR` →
-  释放锁。不把 Parent 悄悄留后台。若 Supervisor 在终止宽限期内崩溃：重启后
-  看到 runtime 定格 `STOPPING`，**完成那次未完成的 stop**（杀组 →
-  `STOPPED_OPERATOR`），绝不 spawn。
+  释放锁。不把 Parent 悄悄留后台。
+- `STOPPING` 是 **durable stop intent**：恢复启动时磁盘**继续保持 `STOPPING`**
+  （绝不先落盘成 `BOOTING`），直到整个 Parent 组确认消失、真正写成
+  `STOPPED_OPERATOR`——无论重启多少次（`STOPPING → crash → STOPPING → …`）
+  都不会丢失 stop intent。
+- 完成 STOPPING 收尾时：PID 已知且身份可验证 → 杀组；PID 未知 → 经
+  `process.json`（token 匹配）找回；无可信身份 → 看 `parent.lock` 租约：
+  空闲 = 没有活着的 launcher/DSH → 完成 stop；被占 = 旧 launcher 可能仍存活
+  → **绝不结束 stop**，继续等 record / 等租约释放。
+- **终止失败必须显式失败**：`terminate_process_group` / `_terminate_group`
+  若 SIGKILL+确认窗口后整个 PGID 仍存在 → 返回失败；Supervisor **绝不**在
+  Parent 仍 alive 时写 `STOPPED_OPERATOR`，改为 `STOPPED_ERROR`
+  （`SUPERVISOR_INTERNAL_ERROR`）。
+- 按 PGID 杀组**必须身份可验证**：`start_id` 缺失或与 `/proc` starttime 不符
+  时，绝不按裸 pid 杀（PID 复用风险），宁可无法自动清理，留给 operator。
 
 ---
 
@@ -315,7 +327,9 @@ Supervisor 重启时三态恢复（`NO_PARENT` / `STARTING_PARENT` / `RUNNING_PA
 ```
 BOOT → 拿独占锁 → 读 runtime.json → 读 .agent/state.json
      → 若 runtime 定格 STOPPING（上次 operator-stop 收尾中崩溃）
-         完成收尾：杀仍在的 Parent 组（pid 未知时经 process.json 找回）→ STOPPED_OPERATOR
+         磁盘**继续保持 STOPPING**（不复位 BOOTING）→ 完成收尾：
+         杀仍在的 Parent 组（pid 未知时经 process.json/租约等待找回；进程组
+         必须确认消失，否则 STOPPED_ERROR）→ STOPPED_OPERATOR
      → 若状态为 STARTING_PARENT（pid 未知）：
          读 .supervisor/runs/activation-N/process.json
          token 一致 + pid 存在 + starttime 一致 + cmdline 仍是 DSH/launcher
@@ -342,7 +356,10 @@ BOOT → 拿独占锁 → 读 runtime.json → 读 .agent/state.json
   继承持有；`process.json` 负责身份发现，`parent.lock` 负责唯一性 —— 拿不到租约
   绝不 spawn 第二个 Parent，从根上封死 `spawn → child writes process.json` 窗口。
 - 整组终止：SIGTERM→grace→SIGKILL 后确认**整个 PGID 消失**（含忽略 SIGTERM 的
-  子进程），而不是只看 leader PID。
+  子进程），而不是只看 leader PID；确认失败（PGID 仍 alive）→ **失败收场**
+  `STOPPED_ERROR`，绝不写 `STOPPED_OPERATOR`。
+- 按 PGID 杀组必须身份可验证（`start_id` 缺失/不符则不杀）；`STOPPING` 在磁盘上
+  durable 保持，直到真正 `STOPPED_OPERATOR`（二次崩溃也不丢 stop intent）。
 - 事件拆分：`PARENT_STARTING`（意图持久化，含 token）→ `PARENT_STARTED`（确认，
   含 pid/process_start_id），便于审计与恢复回放。
 

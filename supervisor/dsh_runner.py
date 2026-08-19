@@ -40,33 +40,38 @@ def _kill_group(pid: int, sig: signal.Signals) -> None:
         pass
 
 
-async def terminate_process_group(pid: int, grace_seconds: float) -> None:
-    """通用进程组终止（供 engine 在收养等路径复用）：
+async def terminate_process_group(pid: int, grace_seconds: float) -> bool:
+    """通用进程组终止（供 engine 在收养/收尾等路径复用）：
 
     SIGTERM 整组 → 轮询到 **整个 PGID 消失**（`process_group_alive` 判据，
     僵尸不算活着）→ 宽限后仍有成员则 SIGKILL 整组 → 确认 PGID 消失。
     绝不只检查 leader PID（leader 死了但子进程忽略 SIGTERM 也必须被清）。
+
+    返回：True = 整个 PGID 已确认消失；False = SIGKILL+确认窗口后仍存活
+    （调用方**必须**失败处理，不得继续宣称 PARENT_KILLED / STOPPED_OPERATOR）。
     """
     import time as _time
     import asyncio as _asyncio
 
     if not pid:
-        return
+        return True
     _kill_group(pid, signal.SIGTERM)
     deadline = _time.monotonic() + max(0, grace_seconds)
     while _time.monotonic() < deadline:
         if not process_group_alive(pid):
-            return
+            return True
         await _asyncio.sleep(0.05)
     if not process_group_alive(pid):
-        return
-    _kill_group(pid, signal.SIGKILL)
-    # SIGKILL 后再给一点时间让内核/init 回收，确认整组消失
-    deadline = _time.monotonic() + 2.0
-    while _time.monotonic() < deadline:
-        if not process_group_alive(pid):
-            return
-        await _asyncio.sleep(0.05)
+        return True
+    # SIGKILL（极端情况如 D-state 一次不够，重试几轮，每轮给出回收窗口）
+    for _ in range(3):
+        _kill_group(pid, signal.SIGKILL)
+        confirm = _time.monotonic() + 2.0
+        while _time.monotonic() < confirm:
+            if not process_group_alive(pid):
+                return True
+            await _asyncio.sleep(0.05)
+    return False
 
 
 class DshRunner:
@@ -74,6 +79,7 @@ class DshRunner:
         self.executable = executable
         self.profile = profile
         self.terminate_grace_seconds = terminate_grace_seconds
+        self.last_pid = None  # 最近一次 spawn 的子进程 pid（cancel 竞态下供引擎确认）
 
     async def run(
         self,
@@ -146,16 +152,18 @@ class DshRunner:
             raise RunnerError(f"failed to spawn launcher: {exc}")
 
         pid = proc.pid
+        self.last_pid = pid
         process_start_id = read_start_id(pid)
         if on_start is not None:
             on_start(pid, process_start_id)
 
         timed_out = False
+        group_survived = False
         try:
             await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
         except asyncio.TimeoutError:
             timed_out = True
-            await self._terminate_group(proc)
+            group_survived = not await self._terminate_group(proc)
         except asyncio.CancelledError:
             await self._terminate_group(proc)
             raise
@@ -185,10 +193,14 @@ class DshRunner:
             reason="",
             pid=pid,
             process_start_id=process_start_id,
+            group_survived=group_survived,
         )
 
-    async def _terminate_group(self, proc) -> None:
-        """SIGTERM 整组 → 等 leader 回收/宽限 → 还有成员则 SIGKILL → 确认 PGID 消失。"""
+    async def _terminate_group(self, proc) -> bool:
+        """SIGTERM 整组 → 等 leader 回收/宽限 → 还有成员则 SIGKILL → 确认 PGID 消失。
+
+        返回 True = 整个 PGID 已确认消失；False = 仍在（调用方必须失败处理）。
+        """
         import time as _time
 
         pgid = proc.pid
@@ -204,16 +216,21 @@ class DshRunner:
             except asyncio.TimeoutError:
                 pass
         if not process_group_alive(pgid):
-            return  # 整组已清（快路径）
+            return True  # 整组已清（快路径）
         # leader 已退出但组内还有成员（如忽略 SIGTERM 的子进程）：把剩余 grace 给它们，
         # 到点仍不退出就 SIGKILL，并最终确认整个 PGID 消失
         while _time.monotonic() < grace_dl and process_group_alive(pgid):
             await asyncio.sleep(0.05)
-        if process_group_alive(pgid):
+        if not process_group_alive(pgid):
+            return True
+        for _ in range(3):
             _kill_group(pgid, signal.SIGKILL)
             dl2 = _time.monotonic() + 2.0
-            while _time.monotonic() < dl2 and process_group_alive(pgid):
+            while _time.monotonic() < dl2:
+                if not process_group_alive(pgid):
+                    return True
                 await asyncio.sleep(0.05)
+        return False
 
     @staticmethod
     def _kill_group(pid: int, sig: signal.Signals) -> None:

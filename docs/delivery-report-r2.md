@@ -1,5 +1,13 @@
 # Doublecheck report
 
+> **Historical review artifact.**
+> Superseded by `.agent/FINAL_REPORT.md` and `docs/supervisor-protocol.md`
+> (and later doublecheck reports). Captured at M5 hardening R2 (before the
+> R3 crash-consistency round). Earlier wording such as
+> "彻底消除重复 Parent（launcher+process.json）" and "不引入第三方依赖" is
+> historical: the current design adds the `parent.lock` lease for uniqueness
+> and a conditional `tomli` dependency for Python 3.8–3.10.
+
 > Verdict: **green**
 
 ## Spec
