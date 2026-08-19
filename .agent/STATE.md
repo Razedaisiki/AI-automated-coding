@@ -37,6 +37,5 @@ M5 hardening（第 1+2+3+4 轮评审）全部完成，全量测试绿，已提�
 
 ## 分支 / 提交
 
-- master 历史：3aabeef … bc5e860 (R1), d0825a1+ba5586f (R2), f96d946 (R3)
-- 本轮待提交：lock/engine/events + tests（stopping_consistency、hardening2）
-  + 协议 §10/§12 + PLAN/STATE/FINAL_REPORT（提交后将同步为已提交）。
+- master 历史：3aabeef … bc5e860 (R1), d0825a1+ba5586f (R2), f96d946 (R3),
+  11993ec (R4，本会话，已提交并推送 origin/master)。
