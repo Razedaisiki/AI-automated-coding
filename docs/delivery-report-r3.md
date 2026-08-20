@@ -1,8 +1,11 @@
 # Doublecheck report
 
-> **Note:** this auto-generated report's "Spec" block reproduces the session's
-> first-recorded doublecheck spec (M5 hardening R1). The **authoritative
-> R3 spec and acceptance evidence** for this round live in
+> **Historical / auto-generated review artifact.**
+> Its test-evidence counters are not authoritative.
+> Authoritative delivery evidence is `.agent/FINAL_REPORT.md`
+> (`docs/development-history/m5-final-report.md` after namespace separation)
+> and `docs/supervisor-protocol.md` §12/§13. This report's "Spec" block
+> reproduces the first-recorded doublecheck spec (M5 hardening R1).
 > `.agent/PLAN.md` / `.agent/STATE.md` / `.agent/FINAL_REPORT.md` and
 > `docs/supervisor-protocol.md` §12/§13; the live test evidence is the
 > full-suite run (`93 passed`) recorded in the session and in

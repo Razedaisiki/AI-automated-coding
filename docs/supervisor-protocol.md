@@ -349,7 +349,10 @@ INVALID_AGENT_STATE | SUPERVISOR_INTERNAL_ERROR | OPERATOR_STOP
 - 审计区分成败：终止成功记 `PARENT_KILLED`；终止失败记 `PARENT_KILL_FAILED`，
   不用同一个事件既表示 "killed" 又表示 "没能 kill 掉"。
 - 按 PGID 杀组**必须身份可验证**：`start_id` 缺失或与 `/proc` starttime 不符
-  时，绝不按裸 pid 杀（PID 复用风险），宁可无法自动清理，留给 operator。
+  时，绝不按裸 pid 杀（PID 复用风险）；若此时 `process_group_alive(recorded_pgid)`
+  仍为 True，则**必须 fail-closed**（`PARENT_KILL_FAILED` /
+  `UNVERIFIABLE_PROCESS_GROUP` → `STOPPED_ERROR + keep_parent`），
+  绝不能视为清理成功而继续 spawn（宁可留给 operator）。
 - 统一的 stop 收尾 reconciliation：无论 STOPPING 来自“崩溃后恢复”还是“当前进程
   刚收到 SIGTERM 取消激活”，都走同一套 —— PID 已验证 → 杀组；PID 未知 →
   `process.json`（token 匹配）；record 未知 → `parent.lock` 租约；确认没有

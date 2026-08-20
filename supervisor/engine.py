@@ -351,8 +351,25 @@ class SupervisorEngine:
                         keep_parent=True,
                     )
                 break  # 组长身份可验证且组本就不存在/已清 → 完成 stop
-            # 组长身份不可验证（尚未 spawn / 已死）→ 尝试用 process.json 更新身份，
-            # 仅当能拿到"与当前不同的"记录时才继续重试，否则落入下面的租约判定
+            # 组长身份不可验证时，先看 PGID 是否仍存活：
+            # - PGID 仍存活 → 绝不能以“lease free 就完成 stop”：
+            #   lease 只绑定 DSH leader 的 FD，不保证覆盖整个 PGID；
+            #   必须 fail-closed（保留身份、留给 operator）。
+            pgid_alive = pid and process_group_alive(pid)
+            if pgid_alive:
+                self.log.emit(
+                    PARENT_KILL_FAILED,
+                    activation=activation_id,
+                    pid=pid,
+                    reason="UNVERIFIABLE_PROCESS_GROUP",
+                )
+                return self._finalize(
+                    StopReason.SUPERVISOR_INTERNAL_ERROR,
+                    SupervisorStatus.STOPPED_ERROR,
+                    1,
+                    keep_parent=True,
+                )
+            # PGID 已消失 → 尝试用 process.json 更新身份
             if token:
                 record = self._load_process_record(activation_id)
                 if record is not None and record.get("activation_token") == token:
@@ -688,19 +705,29 @@ class SupervisorEngine:
 
         安全约束（P0-2/“绝不错杀”）：**必须** start_id 非空且组长身份可验证
         （leader 还在，哪怕已僵尸——starttime 仍可从 /proc 读到）才允许按 pgid
-        杀组；start_id 缺失或身份不符时，组内残留可能是 PID 复用后的无关会话组，
-        **绝不**按裸 pid 冒险杀组，宁可留给 operator。
+        杀组；start_id 缺失或身份不符时，**绝不**按裸 pid 冒险杀组。
+        但若 PGID 仍存活而身份已不可验证，也绝不能返回“清理成功”——那会让调用方
+        以为旧 group 已消失而继续 spawn 新 Parent，造成两个 activation 同时改
+        working tree。正确做法是 **fail-closed：返回 False（留给 operator）**。
 
-        返回 True = 清理完成 / 无可清理（不算失败）；False = 已验证的残留组
-        在终止后仍未消失（调用方**必须 fail-closed**：保留身份、绝不 restart；
-        属于 STALE_GROUP_CLEANUP kill failure）。
+        返回 True = 清理完成 / 无可清理（可继续）；False = 必须 fail-closed
+        （保留身份、绝不 restart；可能是 STALE_GROUP_CLEANUP kill failure，或
+        PGID 仍存活但身份不可验证）。
         """
-        if not pid or not start_id:
+        if not pid:
             return True
-        if not identity_matches(pid, start_id):
-            return True  # 身份不可验证 → 不清理，也不阻止后续流程
-        if not process_group_alive(pid):
+        group_alive = process_group_alive(pid)
+        if not group_alive:
             return True
+        # PGID 仍存活，但身份不可验证 → 不能安全 kill，也绝不能说“已清理”
+        if not start_id or not identity_matches(pid, start_id):
+            self.log.emit(
+                PARENT_KILL_FAILED,
+                activation=0,
+                pid=pid,
+                reason="UNVERIFIABLE_PROCESS_GROUP",
+            )
+            return False
         from .dsh_runner import terminate_process_group
 
         ok = await terminate_process_group(pid, self.config.limits.terminate_grace_seconds)

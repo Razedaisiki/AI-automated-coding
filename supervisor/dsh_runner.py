@@ -150,6 +150,15 @@ class DshRunner:
             out_f.close()
             err_f.close()
             raise RunnerError(f"failed to spawn launcher: {exc}")
+        finally:
+            try:
+                out_f.close()
+            except Exception:
+                pass
+            try:
+                err_f.close()
+            except Exception:
+                pass
 
         pid = proc.pid
         self.last_pid = pid

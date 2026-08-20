@@ -1,11 +1,10 @@
 # Doublecheck report
 
-> **Note:** this auto-generated report's "Spec" block reproduces the session's
-> first-recorded doublecheck spec (M5 hardening R1). The **authoritative R4
-> spec and acceptance evidence** live in `.agent/PLAN.md` /
-> `.agent/STATE.md` / `.agent/FINAL_REPORT.md` and `docs/supervisor-protocol.md`
-> §10/§12; live test evidence is the full-suite run (`96 passed`) in
-> `tests/test_stopping_consistency.py` and `tests/test_hardening2.py`.
+> **Historical / auto-generated review artifact.**
+> Its test-evidence counters are not authoritative.
+> Authoritative delivery evidence is `.agent/FINAL_REPORT.md`
+> (`docs/development-history/m5-final-report.md` after namespace separation)
+> and `docs/supervisor-protocol.md` §10/§12.
 
 > Verdict: **green**
 
