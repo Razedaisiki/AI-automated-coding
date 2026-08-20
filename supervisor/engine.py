@@ -12,6 +12,7 @@
 """
 
 import asyncio
+import json
 import os
 import re
 import signal
@@ -607,20 +608,8 @@ class SupervisorEngine:
             await asyncio.sleep(delay / steps)
 
     async def _wait_ci(self, agent: AgentState) -> None:
-        # Validate WAIT_CI state — lenient when CI disabled to preserve existing tests
         sha_raw = agent.ci.get("sha") if isinstance(agent.ci, dict) else None
         if not isinstance(agent.ci, dict) or not sha_raw:
-            if not self.config.ci.enabled:
-                self.rt.status = SupervisorStatus.WAITING_CI
-                self._save_runtime()
-                self.log.emit(CI_DISABLED, requested_sha=sha_raw)
-                self.log.emit(WAIT_CI, sha=sha_raw)
-                while not self.stop_event.is_set():
-                    st = self._read_agent_state_safe()
-                    if st is None or st.status != agent.status:
-                        return
-                    await asyncio.sleep(0.2)
-                return
             self.log.emit(AGENT_STATE_INVALID, error="WAIT_CI missing ci.sha")
             self.rt.status = SupervisorStatus.STOPPED_ERROR
             self.rt.stop_reason = StopReason.INVALID_AGENT_STATE
@@ -629,38 +618,18 @@ class SupervisorEngine:
             raise AgentStateError("WAIT_CI missing ci.sha")
 
         sha = sha_raw
-        if not isinstance(sha, str) or not re.match(r"^[0-9a-fA-F]{7,40}$", sha.strip()):
-            if not self.config.ci.enabled:
-                sha = sha if isinstance(sha, str) else str(sha)
-                self.rt.status = SupervisorStatus.WAITING_CI
-                self._save_runtime()
-                self.log.emit(CI_DISABLED, requested_sha=sha)
-                self.log.emit(WAIT_CI, sha=sha)
-                while not self.stop_event.is_set():
-                    st = self._read_agent_state_safe()
-                    if st is None or st.status != agent.status:
-                        return
-                    await asyncio.sleep(0.2)
-                return
-            self.log.emit(AGENT_STATE_INVALID, error=f"invalid ci.sha {sha!r}")
-            raise AgentStateError(f"invalid ci.sha {sha!r}")
-
-        sha = sha.strip().lower()  # normalize
-
-        # Verify SHA exists locally (skip when CI disabled for legacy compat)
-        if self.config.ci.enabled and not self._verify_sha_exists(sha):
-            self.log.emit(AGENT_STATE_INVALID, error=f"ci.sha not found locally: {sha}")
-            raise AgentStateError(f"ci.sha not found locally: {sha}")
-
-        # Cross-check git.head/pushed_head if present
+        if not isinstance(sha, str) or not re.match(r"^[0-9a-fA-F]{40}$", sha.strip()):
+            self.log.emit(AGENT_STATE_INVALID, error=f"invalid ci.sha {sha!r} (must be exactly 40 hex chars)")
+            raise AgentStateError(f"invalid ci.sha {sha!r} (must be exactly 40 hex chars)")
+        sha = sha.strip().lower()
         if isinstance(agent.git, dict):
             for key in ("head", "pushed_head"):
                 if key in agent.git and agent.git[key] is not None and agent.git[key] != sha:
-                    # Only error if full 40-char sha mismatch; short sha may be prefix
-                    if len(agent.git[key]) == 40 and len(sha) == 40:
-                        self.log.emit(AGENT_STATE_INVALID, error=f"git.{key} mismatch ci.sha")
-                        raise AgentStateError(f"git.{key} mismatch ci.sha")
-
+                    self.log.emit(AGENT_STATE_INVALID, error=f"git.{key} mismatch ci.sha")
+                    raise AgentStateError(f"git.{key} mismatch ci.sha")
+        # ci.enabled == false: still require valid 40-hex sha (M7 exact-SHA invariant), but
+        # do not verify git object existence — stay in CI_DISABLED wait (legacy WAIT_CI path
+        # now uses enriched fake sha, so this branch is reachable).
         if not self.config.ci.enabled:
             self.rt.status = SupervisorStatus.WAITING_CI
             self._save_runtime()
@@ -672,9 +641,13 @@ class SupervisorEngine:
                     return
                 await asyncio.sleep(0.2)
             return
+        if not self._verify_sha_exists(sha):
+            self.log.emit(AGENT_STATE_INVALID, error=f"ci.sha not found locally: {sha}")
+            raise AgentStateError(f"ci.sha not found locally: {sha}")
 
-        # Durable ci_wait
+        # Durable ci_wait (started_at is durable; elapsed computed from it across restarts)
         import time as _time
+        from datetime import datetime as _dt
         self.rt.status = SupervisorStatus.WAITING_CI
         now = _now_iso()
         if self.rt.ci_wait is None or self.rt.ci_wait.get("sha") != sha:
@@ -684,15 +657,23 @@ class SupervisorEngine:
         self.log.emit(WAIT_CI, sha=sha)
 
         provider = self._make_ci_provider()
-        start_mono = _time.monotonic()
+        # Elapsed must be durable: compute from stored started_at, not local monotonic.
+        # start_mono is only for short sleep bookkeeping; timeout uses started_at.
+        def _elapsed_seconds() -> float:
+            try:
+                started = _dt.fromisoformat(self.rt.ci_wait["started_at"].replace("Z", "+00:00"))
+                return (_dt.now(timezone.utc) - started).total_seconds()
+            except Exception:
+                # fallback: treat as 0 elapsed (grace still applies)
+                return 0.0
+
         grace = self.config.ci.discovery_grace_seconds
         max_wait = self.config.ci.max_wait_seconds
         poll = self.config.ci.poll_seconds
 
         while not self.stop_event.is_set():
-            # budget and timeout check
             self._accrue_budget()
-            if _time.monotonic() - start_mono > max_wait:
+            if _elapsed_seconds() > max_wait:
                 self.log.emit(CI_WAIT_TIMEOUT, sha=sha)
                 try:
                     inbox = self.layout.ci_inbox_dir(sha)
@@ -719,10 +700,9 @@ class SupervisorEngine:
             self.log.emit(CI_OBSERVED, sha=sha, status=self.rt.ci_wait["last_status"])
 
             status_str = self.rt.ci_wait["last_status"]
-            elapsed = _time.monotonic() - start_mono
 
             if status_str == "NOT_FOUND":
-                if elapsed < grace:
+                if _elapsed_seconds() < grace:
                     await asyncio.sleep(poll)
                     continue
                 else:
@@ -744,7 +724,7 @@ class SupervisorEngine:
                 self.rt.status = SupervisorStatus.BOOTING
                 self._save_runtime()
                 self.log.emit(CI_SUCCEEDED, sha=sha)
-                outcome = await self._activation_cycle("CI_SUCCEEDED")
+                outcome = await self._activation_cycle("CI_SUCCEEDED", sha=sha)
                 await self._process_outcome(outcome)
                 return
 
@@ -760,17 +740,25 @@ class SupervisorEngine:
                 self.rt.status = SupervisorStatus.BOOTING
                 self._save_runtime()
                 self.log.emit(CI_FAILED, sha=sha, inbox=str(inbox))
-                outcome = await self._activation_cycle("CI_FAILED")
+                outcome = await self._activation_cycle("CI_FAILED", sha=sha, ci_dir=str(inbox))
                 await self._process_outcome(outcome)
                 return
 
-            if status_str in ("CANCELLED", "ERROR"):
+            if status_str == "CANCELLED":
                 self.rt.ci_wait = None
                 self.rt.status = SupervisorStatus.BOOTING
                 self._save_runtime()
-                outcome = await self._activation_cycle("CI_FAILED")
+                self.log.emit(CI_FAILED, sha=sha, reason="CANCELLED")
+                outcome = await self._activation_cycle("CI_FAILED", sha=sha, ci_dir=str(self.layout.ci_inbox_dir(sha)))
                 await self._process_outcome(outcome)
                 return
+
+            if status_str == "ERROR":
+                # Infrastructure/provider error — do NOT disguise as application CI failure.
+                # Bounded retry: if within max_wait, keep polling; otherwise escalate to STOPPED_ERROR.
+                self.log.emit(CI_OBSERVED, sha=sha, status="ERROR_RETRY")
+                await asyncio.sleep(poll)
+                continue
 
             if status_str == "TIMEOUT":
                 self.rt.status = SupervisorStatus.STOPPED_LIMIT
@@ -1158,8 +1146,47 @@ class SupervisorEngine:
             self.log.emit(GIT_SNAPSHOT, phase="before", activation=activation_id, **git_before.to_dict())
         except Exception:
             pass
+        # M6 recovery evidence: for crash/timeout recovery, include mechanical git drift
+        if reason in ("RECOVER_AFTER_PARENT_CRASH", "RECOVER_AFTER_PARENT_TIMEOUT") and not prompt_kwargs.get("human_event_id"):
+            try:
+                prev_id = activation_id - 1
+                prev_before = None
+                prev_after = None
+                if prev_id >= 1:
+                    bf = self.layout.run_dir(prev_id) / "git-before.json"
+                    af = self.layout.run_dir(prev_id) / "git-after.json"
+                    if bf.exists():
+                        try:
+                            prev_before = json.loads(bf.read_text(encoding="utf-8"))
+                        except Exception:
+                            prev_before = None
+                    if af.exists():
+                        try:
+                            prev_after = json.loads(af.read_text(encoding="utf-8"))
+                        except Exception:
+                            prev_after = None
+                if prev_before is not None or prev_after is not None:
+                    cur = capture_git(self.base).to_dict()
+                    ev_parts = []
+                    if prev_before and prev_after:
+                        if prev_before.get("head") != prev_after.get("head") or prev_before.get("dirty") != prev_after.get("dirty"):
+                            ev_parts.append(f"Previous activation {prev_id} changed Git state:")
+                            ev_parts.append(f"  Before: HEAD={prev_before.get('head')} dirty={prev_before.get('dirty')} branch={prev_before.get('branch')}")
+                            ev_parts.append(f"  After:  HEAD={prev_after.get('head')} dirty={prev_after.get('dirty')} branch={prev_after.get('branch')}")
+                    elif prev_before:
+                        ev_parts.append(f"Previous activation {prev_id} Before: HEAD={prev_before.get('head')} dirty={prev_before.get('dirty')}")
+                    if cur:
+                        ev_parts.append(f"Current: HEAD={cur.get('head')} dirty={cur.get('dirty')} branch={cur.get('branch')}")
+                    if ev_parts:
+                        prompt_kwargs["_git_evidence"] = "\n".join(ev_parts) + "\nInspect the repository (git status/diff/log) before continuing.\n"
+            except Exception:
+                pass
         task_file = self.layout.task_file(self.config).relative_to(self.base).as_posix()
+        # Inject git evidence into prompt if present (append neutral context)
+        _extra_ev = prompt_kwargs.pop("_git_evidence", None)
         prompt = build_prompt(reason, task_file=task_file, **prompt_kwargs)
+        if _extra_ev:
+            prompt = prompt.rstrip() + "\n\n---\n\nMechanical Git evidence:\n" + _extra_ev
         (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
         prev_seq = self.rt.last_agent_checkpoint_seq

@@ -151,20 +151,18 @@ class AgentState:
         review = raw.get("review")
 
         if status == AgentStatus.WAIT_CI:
-            # M7 strict path: when CI is in use, ci.sha + sha format + git consistency are enforced
-            # by engine's _wait_ci before blocking. At model level we keep WAIT_CI permissive for
-            # legacy fake tests that use bare WAIT_CI without sha/git (they rely on CI_DISABLED fallback).
-            if isinstance(ci, dict) and ci.get("sha") is not None:
-                sha = ci["sha"]
-                if not isinstance(sha, str) or not _is_valid_sha(sha):
-                    raise AgentStateError(f"WAIT_CI ci.sha must be a valid hex SHA (7-40 chars), got {sha!r}")
-                if isinstance(git, dict):
-                    for key in ("head", "pushed_head"):
-                        if key in git and git[key] is not None:
-                            if len(sha) == 40 and isinstance(git[key], str) and git[key] != sha:
-                                raise AgentStateError(
-                                    f"WAIT_CI git.{key} ({git[key]!r}) must equal ci.sha ({sha!r}) when both present"
-                                )
+            if not isinstance(ci, dict) or not ci.get("sha"):
+                raise AgentStateError("WAIT_CI requires ci.sha (exact 40-hex commit SHA)")
+            sha = ci["sha"]
+            if not isinstance(sha, str) or not _is_valid_sha(sha):
+                raise AgentStateError(f"WAIT_CI ci.sha must be exactly 40 hex chars, got {sha!r}")
+            if isinstance(git, dict):
+                for key in ("head", "pushed_head"):
+                    if key in git and git[key] is not None:
+                        if not isinstance(git[key], str) or git[key] != sha:
+                            raise AgentStateError(
+                                f"WAIT_CI git.{key} ({git[key]!r}) must exactly equal ci.sha ({sha!r})"
+                            )
 
         if review is not None:
             if not isinstance(review, dict):
@@ -198,7 +196,7 @@ def _is_valid_sha(s: str) -> bool:
     if not isinstance(s, str):
         return False
     s = s.strip()
-    if len(s) < 7 or len(s) > 40:
+    if len(s) != 40:
         return False
     return all(c in "0123456789abcdefABCDEF" for c in s)
 

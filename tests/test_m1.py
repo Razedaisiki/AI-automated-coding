@@ -49,7 +49,10 @@ class TestConfig:
         assert cfg.human.pause_active_wall_clock is True
 
     def test_load_project_toml(self):
-        cfg = load_config(PROJECT_DIR / PROJECT_TOML)
+        toml_path = PROJECT_DIR / PROJECT_TOML
+        if not toml_path.exists():
+            toml_path = PROJECT_DIR / "supervisor.toml.example"
+        cfg = load_config(toml_path)
         assert cfg.version == 1
         assert cfg.dsh.executable == "dsh"
         assert cfg.limits.max_active_wall_seconds == 14400

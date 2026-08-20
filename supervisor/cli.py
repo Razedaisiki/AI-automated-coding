@@ -234,6 +234,7 @@ def cmd_parent_once(args) -> int:
         (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
         git_before = capture_git(repo)
+        atomic_write_json(run_dir / "git-before.json", git_before.to_dict())
         runner = DshRunner(
             executable=config.dsh.executable,
             profile=config.dsh.profile,
@@ -250,6 +251,7 @@ def cmd_parent_once(args) -> int:
             )
         )
         git_after = capture_git(repo)
+        atomic_write_json(run_dir / "git-after.json", git_after.to_dict())
 
         try:
             agent_after = load_agent_state(layout.agent_state_path)
@@ -277,8 +279,6 @@ def cmd_parent_once(args) -> int:
             ),
         }
         atomic_write_json(run_dir / "result.json", data)
-        atomic_write_json(run_dir / "git-before.json", git_before.to_dict())
-        atomic_write_json(run_dir / "git-after.json", git_after.to_dict())
 
         # 记录本次 activation 数，供后续 run 连续编号
         new_rt = rt or RuntimeState(
@@ -404,11 +404,9 @@ def cmd_resume(args) -> int:
         msg = getattr(args, "message", None)
         fpath = getattr(args, "file", None)
         evt = store.append(args.event, message=msg, file=Path(fpath) if fpath else None)
-        # legacy compat: also write resume.json for older supervisors
-        try:
-            atomic_write_json(layout.resume_path, {"event": args.event, "ts": now_iso()})
-        except Exception:
-            pass
+        # Do NOT write legacy resume.json for new CLI invocations — the new
+        # path is HumanEventStore only. _wait_human() retains a one-way
+        # migration for pre-existing legacy resume.json files.
         print(f"supervisor: human event {evt.event_id} written ({args.event})")
         if evt.attachment_path:
             print(f"  attachment: {evt.attachment_path}")
@@ -417,14 +415,8 @@ def cmd_resume(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
-        # fallback to legacy resume.json
-        try:
-            atomic_write_json(layout.resume_path, {"event": args.event, "ts": now_iso()})
-            print("supervisor: resume marker written (%s)" % args.event)
-            return 0
-        except Exception:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 # ------------------------------------------------------------------ main

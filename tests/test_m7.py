@@ -61,8 +61,12 @@ class TestWaitCIValidation:
         cfg.ci.provider = "fake"
         cfg.ci.poll_seconds = 1
         cfg.restart.backoff_seconds = [0.01]
-        # WAIT_CI without sha
-        runner = FakeParentRunner([Step(status="WAIT_CI")], Layout(tmp_repo))
+        # Write bare WAIT_CI directly (bypass FakeParentRunner enrichment)
+        bare = {"schema_version":1,"status":"WAIT_CI","checkpoint_seq":1,"updated_at":"2026-08-18T06:00:00Z"}
+        p = tmp_repo / ".agent" / "state.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(p, bare)
+        runner = FakeParentRunner([Step(status="COMPLETED")], Layout(tmp_repo))
         engine = SupervisorEngine(base_dir=tmp_repo, config=cfg, runner=runner)
         rc = run_engine(engine)
         assert rc == 1

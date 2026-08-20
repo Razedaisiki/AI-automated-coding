@@ -559,7 +559,7 @@ Current: HEAD=... dirty=...
 Inspect the repository (git status/diff/log) before continuing.
 ```
 
-Parent 自行执行 `git status/diff/log` 判断；Supervisor 绝不嵌入 diff 内容。
+`RECOVER_AFTER_PARENT_CRASH / RECOVER_AFTER_PARENT_TIMEOUT` 实际实现需读取最近一次 `activation-*/git-before.json` 与 `git-after.json`（或当前 `capture`）的 `head/dirty/branch` 并在 prompt 中以机械事实呈现，避免泛化提示。Parent 自行执行 `git status/diff/log` 判断；Supervisor 绝不嵌入 diff 内容。
 
 ---
 
@@ -569,7 +569,7 @@ Parent 自行执行 `git status/diff/log` 判断；Supervisor 绝不嵌入 diff 
 - CI 状态统一映射：`NOT_FOUND | PENDING | SUCCESS | FAILURE | CANCELLED | ERROR | TIMEOUT`（`supervisor/models.py:CiStatus`）。
 - `CiObservation` / `CiMaterial` 定义见 `supervisor/ci/base.py`；字段仅用于 identity/state/diagnostics。
 - 超时与轮询：`[ci] poll_seconds > 0`、`discovery_grace_seconds >= 0`、`max_wait_seconds > 0`；`NOT_FOUND` 在 `discovery_grace_seconds` 内继续等待，超出则按 `TIMEOUT` 处理。
-- 等待循环：`WAITING_CI` → `get_status(exact SHA)` → `NOT_FOUND(grace 内继续) / PENDING / SUCCESS(→ CI_SUCCEEDED) / FAILURE(→ collect → CI_FAILED) / CANCELLED|ERROR|TIMEOUT`。
+- 等待循环：`WAITING_CI` → `get_status(exact SHA)` → `NOT_FOUND(grace 内继续) / PENDING / SUCCESS(→ CI_SUCCEEDED) / FAILURE(→ collect → CI_FAILED) / CANCELLED(→ CI_FAILED) / ERROR(→ 重试至 max_wait，绝不伪装为 CI_FAILED) / TIMEOUT`。
 - `SUCCESS != COMPLETED`：Supervisor 绝不自行完成任务。
 - Durability：`runtime.json: ci_wait {sha, provider, started_at, last_status, last_observed_at}`，`kill -9` 重启后继续等待同一 SHA，不启动普通 Parent。
 - Inbox：`.supervisor/inbox/ci-<sha>/{observation.json, summary.txt, failed-jobs.json, logs/}`，幂等、crash-safe、有界（单文件 2 MiB 截断）。
@@ -581,8 +581,8 @@ Parent 自行执行 `git status/diff/log` 判断；Supervisor 绝不嵌入 diff 
 - 持久化：`.supervisor/inbox/human/event-XXXX.json` 追加式（`supervisor/human_events.py:HumanEventStore`），**不是**单文件 `resume.json`（`resume.json` 保留为 legacy 兼容 shims，M8 起新事件一律走 inbox/human）。
 - `HumanEvent V1`：`{event_id, event_type: HUMAN_APPROVED|HUMAN_CHANGES_REQUESTED, created_at, message?, attachment_path?, status: PENDING→DELIVERING→DELIVERED}`，`event_id` 单调递增（如 `human-000003`），进入 `event file / runtime / events.jsonl / activation prompt`。
 - CLI：`supervisor resume [repo] --event HUMAN_APPROVED [--message TEXT] [--file feedback.md]`；`--file` 复制进 `inbox/human/attachments/<event_id>/`。
-- FSM：`WAIT_HUMAN` 期间不启动 Parent，直到 durable event 出现；`PENDING → DELIVERING（落盘 runtime.human_event_id + PARENT_STARTING） → DELIVERED（PARENT_STARTED 后）`，`DELIVERING` 重启后可重试，绝不静默丢失；`active wall-time` 在 `WAITING_HUMAN` 且 `pause_active_wall_clock=true` 时暂停。
-- 事件幂等：同一 `event_id` 可重试交付，但 `HumanEventStore` 按追加顺序 FIFO 去重。
+- FSM：`WAIT_HUMAN` 期间不启动 Parent，直到 durable event 出现；`PENDING → DELIVERING（事件被选中后落盘 runtime.human_event_id） → DELIVERED（该事件对应的 Parent activation 完成退出后）`，`DELIVERING` 重启后可重试（同一 `event_id` 可能触发第二次 activation，需 Parent 侧幂等处理），绝不静默丢失；`active wall-time` 在 `WAITING_HUMAN` 且 `pause_active_wall_clock=true` 时暂停。
+- 事件幂等：同一 `event_id` 可重试交付，但 `HumanEventStore` 按追加顺序 FIFO 去重；Parent 必须对同一 `event_id` 的重复交付结果幂等（检查已应用的变更/已存在的 review 状态）。
 
 ## 17. Parent Delivery Contract（M9）
 

@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["supervisor", "supervisor.resources"]
+include = ["supervisor*"]
 
 [tool.setuptools.package-data]
 "supervisor.resources" = ["*.md", "*.json"]

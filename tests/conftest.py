@@ -141,11 +141,18 @@ class FakeParentRunner:
         else:
             self._seq += 1
             seq = self._seq
+        # M7 exact-SHA invariant: legacy bare WAIT_CI fakes must be auto-enriched
+        # to remain valid when engine enforces 40-hex. CI_DISABLED legacy path is separate.
+        extra = {}
+        if step.status == "WAIT_CI":
+            fake_sha = "a" * 40
+            extra = {"ci": {"sha": fake_sha}, "git": {"head": fake_sha, "pushed_head": fake_sha}}
         state = AgentState(
             schema_version=1,
             status=AgentStatus(step.status),
             checkpoint_seq=seq,
             updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            **extra,
         )
         self.layout.agent_state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.layout.agent_state_path.with_suffix(".json.tmp")

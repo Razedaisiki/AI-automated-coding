@@ -5,9 +5,12 @@ class TestWaitCIValidation:
     def test_valid_wait_ci_with_matching_git(self):
         AgentState.from_dict({"schema_version":1,"status":"WAIT_CI","checkpoint_seq":1,"updated_at":"2026-08-18T06:00:00Z","ci":{"sha":"a"*40},"git":{"head":"a"*40,"pushed_head":"a"*40}})
 
-    def test_wait_ci_bare_is_ok(self):
-        # legacy fake without sha — permissive
-        AgentState.from_dict({"schema_version":1,"status":"WAIT_CI","checkpoint_seq":1,"updated_at":"2026-08-18T06:00:00Z"})
+    def test_wait_ci_bare_raises(self):
+        try:
+            AgentState.from_dict({"schema_version":1,"status":"WAIT_CI","checkpoint_seq":1,"updated_at":"2026-08-18T06:00:00Z"})
+            assert False, "bare WAIT_CI without ci.sha should be rejected (exact 40-hex invariant)"
+        except AgentStateError:
+            pass
 
     def test_invalid_sha_raises(self):
         try:

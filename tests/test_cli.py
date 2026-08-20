@@ -132,8 +132,12 @@ class TestStatusEventsResume:
     def test_resume_writes_marker(self, tmp_repo):
         rc = main(["resume", str(tmp_repo), "--event", "HUMAN_APPROVED"])
         assert rc == 0
-        marker = json.loads((tmp_repo / ".supervisor" / "resume.json").read_text(encoding="utf-8"))
-        assert marker["event"] == "HUMAN_APPROVED"
+        # New CLI writes to HumanEventStore, not legacy resume.json
+        from supervisor.human_events import HumanEventStore
+        from supervisor.storage import Layout as _Layout
+        store = HumanEventStore(_Layout(tmp_repo).human_inbox_dir)
+        evts = store.list_all()
+        assert len(evts) == 1 and evts[0].event_type == "HUMAN_APPROVED"
 
     def test_resume_rejects_unknown_event(self, tmp_repo):
         rc = main(["resume", str(tmp_repo), "--event", "NOPE"])
