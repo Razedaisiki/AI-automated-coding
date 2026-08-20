@@ -78,6 +78,11 @@ Supervisor 只用只读探测：`rev-parse`、`symbolic-ref`、`status --porcela
 
 两个角色**永不写同一个文件**。`runtime.json` 永远只能由 Supervisor 原子写。
 
+> **不变式**：没有明确存在的 active task source（`supervisor.toml [task].file`
+> 指向的文件），就绝不启动任何 Parent。`supervisor init --task <file>` 持久化
+> task 路径到 `supervisor.toml`；`supervisor run` / `parent-once` 在 spawn 前
+> 均验证 task 文件存在，否则 `error: task file not found`（rc=1）。
+
 ---
 
 ## 3. Agent 状态（`.agent/state.json`）

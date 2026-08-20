@@ -107,7 +107,7 @@ def cmd_init(args) -> int:
         cfg = load_config(toml)
     except ConfigError:
         pass
-    # CLI --task takes precedence even at init time (validated via Layout.task_file)
+    # CLI --task takes precedence and is persisted to supervisor.toml
     task_arg = getattr(args, "task", None)
     if task_arg:
         from .config import TaskConfig
@@ -116,6 +116,33 @@ def cmd_init(args) -> int:
         cfg.task = TaskConfig(file=task_arg)
         # Validate task path (repo-relative, no escape) using the same rule as Layout.task_file
         Layout(repo).task_file(cfg)
+        # Persist the overridden task file into supervisor.toml so `run` without
+        # --task picks up the same location ("init tells A, run must not go to B")
+        try:
+            existing_text = toml.read_text(encoding="utf-8")
+        except OSError:
+            existing_text = ""
+        if "[task]" in existing_text:
+            # Replace existing [task] file = "..." line
+            import re
+
+            new_text, n = re.subn(
+                r'(?m)^\s*file\s*=.*$',
+                f'file = "{task_arg}"',
+                existing_text,
+                count=1,
+            )
+            if n == 0:
+                # [task] exists but no file line — insert under [task]
+                new_text = existing_text.replace(
+                    "[task]", f'[task]\nfile = "{task_arg}"', 1
+                )
+        else:
+            # No [task] section yet — append
+            sep = "" if existing_text.endswith("\n") or not existing_text else "\n"
+            new_text = existing_text + f"{sep}\n[task]\nfile = \"{task_arg}\"\n"
+        if new_text != existing_text:
+            toml.write_text(new_text, encoding="utf-8")
     _ensure_task_file(repo, layout, cfg)
     print("supervisor: initialized workspace for %s" % repo)
     for p in (layout.supervisor_dir, layout.runs_dir, layout.inbox_dir):
@@ -178,6 +205,15 @@ def cmd_parent_once(args) -> int:
         config.task = TaskConfig(file=args.task)
         Layout(repo).task_file(config)  # validate
     layout = Layout(repo)
+    # No active task source → never start a Parent (protocol §2 fail-closed)
+    task_path = layout.task_file(config)
+    if not task_path.exists():
+        print(
+            f"error: task file not found: {task_path} "
+            "(run `supervisor init --task <file>` or create it)",
+            file=sys.stderr,
+        )
+        return 1
     layout.ensure_dirs()
     lock = SupervisorLock(layout.lock_path)
     lock.acquire()
@@ -193,7 +229,7 @@ def cmd_parent_once(args) -> int:
         run_dir = layout.run_dir(activation_id)
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        task_file = Layout(repo).task_file(config).relative_to(repo).as_posix()
+        task_file = task_path.relative_to(repo).as_posix()
         prompt = args.prompt or build_prompt("INITIAL_START", task_file=task_file)
         (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 

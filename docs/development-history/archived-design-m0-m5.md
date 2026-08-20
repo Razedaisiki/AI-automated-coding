@@ -1,3 +1,7 @@
+> **Historical artifact — archived from `AI_automated_coding.md` at Runtime Namespace Separation.**
+> Not a live task file. See `docs/supervisor-protocol.md §0` for ownership.
+> This was the M0–M5 initial design draft, kept for provenance only.
+
 对。现在可以把目标收敛得非常清楚：
 
 > **历史设计文档（archived design）**：本文档是 M0–M5 阶段的设计稿，保留作
