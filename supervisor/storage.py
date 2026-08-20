@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .config import ConfigError
 from .models import AgentState, AgentStateError, RuntimeState
 
 _RUN_DIR_PREFIX = "activation-"
@@ -85,8 +86,10 @@ class Layout:
     def task_file(self, config=None) -> Path:
         """解析 Task 文件路径（支持 [task].file，默认 .supervisor/task.md）。
 
-        Returns a canonical repo-relative-resolved path and guarantees it
-        stays inside the target repository (no ``..`` escape).
+        Task file must be repo-relative and must not escape the repository.
+        All paths are resolved + checked via ``relative_to`` (no special-case
+        for ``..`` in parts — ``foo/../bar`` and ``../../outside`` are both
+        caught).
         """
         raw = None
         if config is not None and getattr(config, "task", None) is not None:
@@ -95,17 +98,14 @@ class Layout:
             raw = ".supervisor/task.md"
         p = Path(raw)
         if p.is_absolute():
-            return p
-        # Reject path traversal that escapes the repository (e.g. "../../other/TASK.md")
-        # Config already validates this for file-based config, but Layout must also
-        # enforce it for programmatic callers (tests, CLI overrides).
-        if ".." in p.parts:
-            candidate = (self.base / p).resolve()
-            try:
-                candidate.relative_to(self.base.resolve())
-            except ValueError:
-                raise ValueError(f"task file escapes repository: {raw!r}")
-        return self.base / p
+            raise ConfigError(f"task file must be repo-relative: {raw!r}")
+        base = self.base.resolve()
+        candidate = (base / p).resolve()
+        try:
+            candidate.relative_to(base)
+        except ValueError:
+            raise ConfigError(f"task file escapes repository: {raw!r}")
+        return candidate
 
     # Supervisor 世界（只写）
     @property

@@ -38,7 +38,10 @@ def _load_parent_policy() -> str:
     p = Path(__file__).resolve().parent / "resources" / "parent-policy.md"
     if p.exists():
         return p.read_text(encoding="utf-8").strip()
-    return ""
+    raise RuntimeError(
+        "packaged parent policy is missing: supervisor/resources/parent-policy.md "
+        "(package-data not installed correctly)"
+    )
 
 
 _PARENT_POLICY = _load_parent_policy()

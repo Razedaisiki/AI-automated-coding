@@ -8,6 +8,12 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",
 ]
 
+[tool.setuptools.packages.find]
+include = ["supervisor", "supervisor.resources"]
+
+[tool.setuptools.package-data]
+"supervisor.resources" = ["*.md", "*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

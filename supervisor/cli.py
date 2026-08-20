@@ -107,13 +107,15 @@ def cmd_init(args) -> int:
         cfg = load_config(toml)
     except ConfigError:
         pass
-    # CLI --task takes precedence even at init time
+    # CLI --task takes precedence even at init time (validated via Layout.task_file)
     task_arg = getattr(args, "task", None)
     if task_arg:
         from .config import TaskConfig
 
         cfg = cfg or default_config()
         cfg.task = TaskConfig(file=task_arg)
+        # Validate task path (repo-relative, no escape) using the same rule as Layout.task_file
+        Layout(repo).task_file(cfg)
     _ensure_task_file(repo, layout, cfg)
     print("supervisor: initialized workspace for %s" % repo)
     for p in (layout.supervisor_dir, layout.runs_dir, layout.inbox_dir):
@@ -130,12 +132,12 @@ def cmd_init(args) -> int:
 def cmd_run(args) -> int:
     repo = _repo(args.repo)
     config = load_config(repo / "supervisor.toml")
-    # CLI --task overrides config [task].file for this invocation
+    # CLI --task overrides config [task].file for this invocation (validated)
     if getattr(args, "task", None):
         from .config import TaskConfig
 
         config.task = TaskConfig(file=args.task)
-        # Persist task file location so engine sees it consistently
+        Layout(repo).task_file(config)  # validate repo-relative + no escape
         Layout(repo).task_file(config).parent.mkdir(parents=True, exist_ok=True)
     # Fail fast if task file is missing (do not silently invent a task)
     if not Layout(repo).task_file(config).exists():
@@ -174,6 +176,7 @@ def cmd_parent_once(args) -> int:
         from .config import TaskConfig
 
         config.task = TaskConfig(file=args.task)
+        Layout(repo).task_file(config)  # validate
     layout = Layout(repo)
     layout.ensure_dirs()
     lock = SupervisorLock(layout.lock_path)

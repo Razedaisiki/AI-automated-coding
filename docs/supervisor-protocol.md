@@ -62,7 +62,7 @@ Supervisor 只用只读探测：`rev-parse`、`symbolic-ref`、`status --porcela
 |---|---|---|---:|---|
 | 项目源码 | Target repo | 人/Parent | ✅ | 目标仓库的所有代码 |
 | `AGENTS.md` | Target repo / user | 人 | ✅ 可选 | 目标仓库的 agent 补充说明（非 Supervisor 策略） |
-| `supervisor.toml` | Target repo / user | 人 / `supervisor init` | ✅ 可选 | 配置（`[task].file` 指定 task 源，默认 `.supervisor/task.md`） |
+| `supervisor.toml` | Target repo / user | 人 / `supervisor init` | ❌ (模板 `supervisor.toml.example` 被跟踪) | 配置（`[task].file` 指定 task 源，默认 `.supervisor/task.md`） |
 | `supervisor/resources/parent-policy.md` | Supervisor package | Supervisor 维护者 | ✅ | Parent 角色/委托/验证/完成策略（经 prompt 注入） |
 | `supervisor/resources/agent-state.schema.json` | Supervisor package | Supervisor 维护者 | ✅ | `agent/state.json` 示例 schema |
 | `.supervisor/task.md` | Supervisor / User | 人（或 `supervisor init --task`） | ❌ | 任务描述（可经 `supervisor.toml [task].file` 配置） |
