@@ -266,6 +266,8 @@ class SupervisorEngine:
                             except Exception:
                                 pass
                             self.rt.human_event_id = None
+                            # Gate is consumed with its event — clear for next WAIT_HUMAN
+                            self.rt.human_gate = None
                             self._save_runtime()
                         result = await self._process_outcome(outcome)
                         if result is None:
@@ -578,17 +580,10 @@ class SupervisorEngine:
         return GitHubCiProvider()
 
     def _verify_sha_exists(self, sha: str) -> bool:
-        # In non-git repos (tests) git rev-parse fails with "not a git repo".
-        # Treat as verification passed to keep fake tests working; real repos
-        # will have .git and the check matters.
-        if not (self.base / ".git").exists():
-            # Also check if repo is inside work tree
-            try:
-                r0 = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(self.base), capture_output=True, timeout=5)
-                if r0.returncode != 0:
-                    return True
-            except Exception:
-                return True
+        # When CI is enabled, WAIT_CI requires the SHA to be a local commit
+        # regardless of repo type. Non-Git repos with ci.enabled must fail
+        # closed (fail-open would accept fake SHAs). The caller handles
+        # ci.enabled==false separately.
         r = subprocess.run(["git", "rev-parse", "--verify", sha], cwd=str(self.base), capture_output=True, timeout=5)
         return r.returncode == 0
 
@@ -771,10 +766,36 @@ class SupervisorEngine:
             await asyncio.sleep(poll)
 
     async def _wait_human(self) -> Optional[str]:
+        # Establish gate identity for this WAIT_HUMAN: all consumed events must bind to it.
+        gate_id = getattr(self.rt, "human_gate", None)
+        if isinstance(gate_id, dict):
+            gate_id = gate_id.get("gate_id")
+        if not gate_id:
+            import uuid as _uuid
+            gate = {
+                "gate_id": f"gate-{_uuid.uuid4().hex[:12]}",
+                "checkpoint_seq": self.rt.last_agent_checkpoint_seq,
+                "entered_at": _now_iso(),
+            }
+            # Include PR/head context if agent is WAIT_HUMAN with review
+            try:
+                st = self._read_agent_state_safe()
+                if st and st.review:
+                    gate["pr_number"] = st.review.get("pr_number")
+                    gate["head_sha"] = st.review.get("head_sha")
+            except Exception:
+                pass
+            self.rt.human_gate = gate
+            self._save_runtime()
+            gate_id = gate["gate_id"]
+        else:
+            # human_gate is already a dict — extract gate_id
+            gate_id = self.rt.human_gate.get("gate_id") if isinstance(self.rt.human_gate, dict) else gate_id
+
         self.rt.status = SupervisorStatus.WAITING_HUMAN
         self._accrue_budget()
         self._save_runtime()
-        self.log.emit(WAIT_HUMAN)
+        self.log.emit(WAIT_HUMAN, gate_id=gate_id)
         store = HumanEventStore(self.layout.human_inbox_dir)
         def _migrate_resume():
             if self.layout.resume_path.exists():
@@ -782,7 +803,7 @@ class SupervisorEngine:
                     marker = read_json_strict(self.layout.resume_path)
                     evt = marker.get("event")
                     if evt in ("HUMAN_APPROVED", "HUMAN_CHANGES_REQUESTED"):
-                        store.append(evt, message=marker.get("message"))
+                        store.append(evt, message=marker.get("message"), gate_id=gate_id)
                         try:
                             self.layout.resume_path.unlink()
                         except OSError:
@@ -794,16 +815,17 @@ class SupervisorEngine:
         _migrate_resume()
         while not self.stop_event.is_set():
             _migrate_resume()
-            evt = store.next_pending()
+            evt = store.next_pending(gate_id=gate_id)
             if evt is not None:
                 store.mark_delivering(evt.event_id)
                 self.rt.human_event_id = evt.event_id
                 self._save_runtime()
-                self.log.emit(HUMAN_EVENT_RECEIVED, event_id=evt.event_id, event_type=evt.event_type)
-                self.log.emit(HUMAN_EVENT_DELIVERY_STARTED, event_id=evt.event_id)
+                self.log.emit(HUMAN_EVENT_RECEIVED, event_id=evt.event_id, event_type=evt.event_type, gate_id=gate_id)
+                self.log.emit(HUMAN_EVENT_DELIVERY_STARTED, event_id=evt.event_id, gate_id=gate_id)
                 self.rt.status = SupervisorStatus.BOOTING
                 self._accrue_budget()
                 self._save_runtime()
+                # Keep gate until delivery completes; clear after DELIVERED in caller
                 return evt.event_type
             await asyncio.sleep(0.2)
         return None
@@ -1144,8 +1166,9 @@ class SupervisorEngine:
         try:
             atomic_write_json(run_dir / "git-before.json", git_before.to_dict())
             self.log.emit(GIT_SNAPSHOT, phase="before", activation=activation_id, **git_before.to_dict())
-        except Exception:
-            pass
+        except Exception as exc:
+            self.log.emit("GIT_EVIDENCE_WRITE_FAILED", phase="before", activation=activation_id, error=str(exc))
+            return Outcome(action="stop_error", keep_parent=False)
         # M6 recovery evidence: for crash/timeout recovery, include mechanical git drift
         if reason in ("RECOVER_AFTER_PARENT_CRASH", "RECOVER_AFTER_PARENT_TIMEOUT") and not prompt_kwargs.get("human_event_id"):
             try:
@@ -1169,12 +1192,12 @@ class SupervisorEngine:
                     cur = capture_git(self.base).to_dict()
                     ev_parts = []
                     if prev_before and prev_after:
-                        if prev_before.get("head") != prev_after.get("head") or prev_before.get("dirty") != prev_after.get("dirty"):
+                        if prev_before.get("head") != prev_after.get("head") or prev_before.get("dirty") != prev_after.get("dirty") or prev_before.get("branch") != prev_after.get("branch"):
                             ev_parts.append(f"Previous activation {prev_id} changed Git state:")
                             ev_parts.append(f"  Before: HEAD={prev_before.get('head')} dirty={prev_before.get('dirty')} branch={prev_before.get('branch')}")
                             ev_parts.append(f"  After:  HEAD={prev_after.get('head')} dirty={prev_after.get('dirty')} branch={prev_after.get('branch')}")
                     elif prev_before:
-                        ev_parts.append(f"Previous activation {prev_id} Before: HEAD={prev_before.get('head')} dirty={prev_before.get('dirty')}")
+                        ev_parts.append(f"Previous activation {prev_id} Before: HEAD={prev_before.get('head')} dirty={prev_before.get('dirty')} branch={prev_before.get('branch')}")
                     if cur:
                         ev_parts.append(f"Current: HEAD={cur.get('head')} dirty={cur.get('dirty')} branch={cur.get('branch')}")
                     if ev_parts:

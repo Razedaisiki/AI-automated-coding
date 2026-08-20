@@ -320,6 +320,7 @@ class RuntimeState:
     stop_reason: Optional[StopReason] = None
     ci_wait: Optional[Dict[str, Any]] = None
     human_event_id: Optional[str] = None
+    human_gate: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -336,6 +337,7 @@ class RuntimeState:
             "stop_reason": self.stop_reason.value if self.stop_reason else None,
             "ci_wait": self.ci_wait,
             "human_event_id": self.human_event_id,
+            "human_gate": self.human_gate,
         }
 
     @classmethod
@@ -365,6 +367,7 @@ class RuntimeState:
             stop_reason=StopReason(raw["stop_reason"]) if raw.get("stop_reason") else None,
             ci_wait=raw.get("ci_wait"),
             human_event_id=raw.get("human_event_id"),
+            human_gate=raw.get("human_gate"),
         )
 
 

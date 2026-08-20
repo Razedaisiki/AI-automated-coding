@@ -48,11 +48,19 @@ class TestCIFakeProvider:
 
     @pytest.mark.asyncio
     async def test_per_sha_script(self, tmp_path):
-        prov = FakeCiProvider({"aaa": [CiStatus.SUCCESS], "bbb": [CiStatus.FAILURE], "_default": [CiStatus.PENDING]})
-        o = await prov.get_status(repo=tmp_path, sha="aaa1234567")
-        assert o.status == CiStatus.SUCCESS  # prefix match? Actually exact prefix logic — "aaa" prefix of "aaa123"
-        o2 = await prov.get_status(repo=tmp_path, sha="ccc1234567")
+        # Exact-SHA default: short keys require explicit allow_prefix
+        sha_a = "a" * 40
+        sha_b = "b" * 40
+        sha_c = "c" * 40
+        prov = FakeCiProvider({sha_a: [CiStatus.SUCCESS], sha_b: [CiStatus.FAILURE], "_default": [CiStatus.PENDING]})
+        o = await prov.get_status(repo=tmp_path, sha=sha_a)
+        assert o.status == CiStatus.SUCCESS
+        o2 = await prov.get_status(repo=tmp_path, sha=sha_c)
         assert o2.status == CiStatus.PENDING
+        # prefix mode is opt-in
+        prov2 = FakeCiProvider({"aaa": [CiStatus.SUCCESS], "_default": [CiStatus.PENDING]}, allow_prefix=True)
+        o3 = await prov2.get_status(repo=tmp_path, sha="aaa1234567" + "0"*30)
+        assert o3.status == CiStatus.SUCCESS
 
 class TestWaitCIValidation:
     def test_missing_sha_when_ci_enabled_is_error(self, tmp_repo):

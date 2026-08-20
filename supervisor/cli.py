@@ -403,11 +403,13 @@ def cmd_resume(args) -> int:
         store = HumanEventStore(layout.human_inbox_dir)
         msg = getattr(args, "message", None)
         fpath = getattr(args, "file", None)
-        evt = store.append(args.event, message=msg, file=Path(fpath) if fpath else None)
-        # Do NOT write legacy resume.json for new CLI invocations — the new
-        # path is HumanEventStore only. _wait_human() retains a one-way
-        # migration for pre-existing legacy resume.json files.
+        gate_id = getattr(args, "gate_id", None)
+        # If caller knows the target gate (from `supervisor status` or prior WAIT_HUMAN),
+        # bind the event to it; otherwise leave gate_id None (legacy compat — consumed by next gate).
+        evt = store.append(args.event, message=msg, file=Path(fpath) if fpath else None, gate_id=gate_id)
         print(f"supervisor: human event {evt.event_id} written ({args.event})")
+        if evt.gate_id:
+            print(f"  gate: {evt.gate_id}")
         if evt.attachment_path:
             print(f"  attachment: {evt.attachment_path}")
         return 0
@@ -458,6 +460,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--event", required=True)
     p.add_argument("--message", default=None, help="human feedback message (for CHANGES_REQUESTED)")
     p.add_argument("--file", dest="file", default=None, help="path to feedback file to attach (copied into inbox)")
+    p.add_argument("--gate-id", dest="gate_id", default=None, help="bind this event to a specific WAIT_HUMAN gate (from status/log)")
 
     args = parser.parse_args(argv)
 
