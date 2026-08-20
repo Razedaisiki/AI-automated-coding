@@ -1,11 +1,15 @@
 # supervisor.toml — Autonomous Development Supervisor configuration (V1)
 # See docs/supervisor-protocol.md for the full protocol.
+# Task source: see [task].file (default .supervisor/task.md).
 
 version = 1
 
 [dsh]
 executable = "dsh"
 profile = "headless"
+
+[task]
+file = ".supervisor/task.md"
 
 [limits]
 max_parent_activations = 20

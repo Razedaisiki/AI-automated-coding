@@ -41,6 +41,9 @@ version = 1
 executable = "dsh"
 profile = "headless"
 
+[task]
+file = ".supervisor/task.md"
+
 [limits]
 max_parent_activations = 20
 max_crash_restarts = 5
@@ -75,6 +78,20 @@ def _repo(arg: str) -> Path:
 # ---------------------------------------------------------------- commands
 
 
+def _ensure_task_file(repo: Path, layout: Layout, config) -> None:
+    """Ensure the task file exists (CLI --task > [task].file > default).
+    Creates parent dirs; if file is missing, writes a placeholder that
+    prompts the user to fill it. Never overwrites an existing file."""
+    task_path = layout.task_file(config)
+    if task_path.exists():
+        return
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    task_path.write_text(
+        "# Task\n\nDescribe the development task for the Parent Agent here.\n",
+        encoding="utf-8",
+    )
+
+
 def cmd_init(args) -> int:
     repo = _repo(args.repo)
     layout = Layout(repo)
@@ -84,18 +101,50 @@ def cmd_init(args) -> int:
     if not toml.exists():
         toml.write_text(DEFAULT_TOML, encoding="utf-8")
         created.append(str(toml))
+    # Seed task file from CLI --task or config default; strictly runtime-owned
+    cfg = None
+    try:
+        cfg = load_config(toml)
+    except ConfigError:
+        pass
+    # CLI --task takes precedence even at init time
+    task_arg = getattr(args, "task", None)
+    if task_arg:
+        from .config import TaskConfig
+
+        cfg = cfg or default_config()
+        cfg.task = TaskConfig(file=task_arg)
+    _ensure_task_file(repo, layout, cfg)
     print("supervisor: initialized workspace for %s" % repo)
     for p in (layout.supervisor_dir, layout.runs_dir, layout.inbox_dir):
         if p.exists():
             print("  created: %s" % p)
     if created:
         print("  created: %s" % created[0])
+    task_path = layout.task_file(cfg)
+    if task_path.exists():
+        print("  task: %s" % task_path)
     return 0
 
 
 def cmd_run(args) -> int:
     repo = _repo(args.repo)
     config = load_config(repo / "supervisor.toml")
+    # CLI --task overrides config [task].file for this invocation
+    if getattr(args, "task", None):
+        from .config import TaskConfig
+
+        config.task = TaskConfig(file=args.task)
+        # Persist task file location so engine sees it consistently
+        Layout(repo).task_file(config).parent.mkdir(parents=True, exist_ok=True)
+    # Fail fast if task file is missing (do not silently invent a task)
+    if not Layout(repo).task_file(config).exists():
+        print(
+            f"error: task file not found: {Layout(repo).task_file(config)} "
+            "(run `supervisor init --task <file>` or create it)",
+            file=sys.stderr,
+        )
+        return 1
     engine = SupervisorEngine(base_dir=repo, config=config)
 
     async def _amain() -> int:
@@ -121,6 +170,10 @@ def cmd_run(args) -> int:
 def cmd_parent_once(args) -> int:
     repo = _repo(args.repo)
     config = load_config(repo / "supervisor.toml")
+    if getattr(args, "task", None):
+        from .config import TaskConfig
+
+        config.task = TaskConfig(file=args.task)
     layout = Layout(repo)
     layout.ensure_dirs()
     lock = SupervisorLock(layout.lock_path)
@@ -137,7 +190,8 @@ def cmd_parent_once(args) -> int:
         run_dir = layout.run_dir(activation_id)
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        prompt = args.prompt or build_prompt("INITIAL_START")
+        task_file = Layout(repo).task_file(config).relative_to(repo).as_posix()
+        prompt = args.prompt or build_prompt("INITIAL_START", task_file=task_file)
         (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
         git_before = capture_git(repo)
@@ -322,13 +376,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p = sub.add_parser("init", help="create .supervisor/ layout and supervisor.toml")
     p.add_argument("repo", nargs="?", default=".")
+    p.add_argument("--task", default=None, help="task file path (repo-relative, default .supervisor/task.md)")
 
     p = sub.add_parser("run", help="run the supervisor loop (foreground)")
     p.add_argument("repo", nargs="?", default=".")
+    p.add_argument("--task", default=None, help="task file path override (repo-relative)")
 
     p = sub.add_parser("parent-once", help="run exactly one DSH parent activation")
     p.add_argument("repo", nargs="?", default=".")
     p.add_argument("--prompt", default=None, help="override the bootstrap prompt")
+    p.add_argument("--task", default=None, help="task file path override")
 
     p = sub.add_parser("status", help="show runtime + agent state summary")
     p.add_argument("repo", nargs="?", default=".")

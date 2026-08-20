@@ -59,6 +59,11 @@ class HumanConfig:
 
 
 @dataclass
+class TaskConfig:
+    file: str = ".supervisor/task.md"
+
+
+@dataclass
 class Config:
     version: int = 1
     dsh: DshConfig = field(default_factory=DshConfig)
@@ -66,6 +71,7 @@ class Config:
     restart: RestartConfig = field(default_factory=RestartConfig)
     ci: CiConfig = field(default_factory=CiConfig)
     human: HumanConfig = field(default_factory=HumanConfig)
+    task: TaskConfig = field(default_factory=TaskConfig)
 
 
 def default_config() -> Config:
@@ -184,6 +190,21 @@ def _build_human(sec_raw: Any) -> HumanConfig:
     )
 
 
+def _build_task(sec_raw: Any) -> TaskConfig:
+    if sec_raw is None:
+        return TaskConfig()
+    if not isinstance(sec_raw, dict):
+        raise ConfigError("config [task] must be a table")
+    for k in set(sec_raw) - {"file"}:
+        _warn(f"unknown key in [task]: {k}")
+    raw = sec_raw.get("file", ".supervisor/task.md")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ConfigError(f"config [task].file must be a non-empty string, got {raw!r}")
+    if raw.strip().startswith("/"):
+        raise ConfigError("config [task].file must be a repo-relative path, not absolute")
+    return TaskConfig(file=raw.strip())
+
+
 def load_config(path) -> Config:
     path = Path(path)
     if not path.exists():
@@ -200,7 +221,7 @@ def load_config(path) -> Config:
         raise ConfigError(f"unsupported supervisor.toml version={version!r} (expected 1)")
 
     for k in set(data) - {
-        "version", "dsh", "limits", "restart", "ci", "human",
+        "version", "dsh", "limits", "restart", "ci", "human", "task",
     }:
         _warn(f"unknown top-level key in supervisor.toml: {k}")
 
@@ -224,4 +245,5 @@ def load_config(path) -> Config:
         restart=_build_restart(data.get("restart")),
         ci=_build_ci(data.get("ci")),
         human=_build_human(data.get("human")),
+        task=_build_task(data.get("task")),
     )

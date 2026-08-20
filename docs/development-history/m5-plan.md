@@ -1,3 +1,6 @@
+> **Historical artifact** — archived from `.agent/` at Runtime Namespace Separation.
+> Not a live task file. See `docs/supervisor-protocol.md §0` for ownership.
+
 # .agent/PLAN.md — M5 hardening（第 1+2+3+4 轮评审意见）
 
 ## 目标

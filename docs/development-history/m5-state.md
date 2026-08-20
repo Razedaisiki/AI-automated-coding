@@ -1,3 +1,6 @@
+> **Historical artifact** — archived from `.agent/` at Runtime Namespace Separation.
+> Not a live task file. See `docs/supervisor-protocol.md §0` for ownership.
+
 # .agent/STATE.md — 当前执行状态
 
 ## 阶段

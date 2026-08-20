@@ -1,3 +1,6 @@
+> **Historical artifact** — archived from `.agent/` at Runtime Namespace Separation.
+> Not a live task file. See `docs/supervisor-protocol.md §0` for ownership.
+
 # .agent/WORKFLOW.md — Autonomous Development State Machine
 
 ## Objective

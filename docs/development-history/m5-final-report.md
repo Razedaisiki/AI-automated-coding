@@ -1,3 +1,6 @@
+> **Historical artifact** — archived from `.agent/` at Runtime Namespace Separation.
+> Not a live task file. See `docs/supervisor-protocol.md §0` for ownership.
+
 # .agent/FINAL_REPORT.md — 交付报告
 
 ## 任务

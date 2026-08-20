@@ -6,10 +6,9 @@ __pycache__/
 # Supervisor runtime artifacts (owned by Supervisor, never committed)
 .supervisor/
 
-# Agent protocol state (written by Parent at runtime)
-.agent/state.json
-.agent/state.json.tmp
-.agent/state.json.tmp.*
+# Agent runtime state — never tracked in the Supervisor source repo.
+# See docs/supervisor-protocol.md §0 (Source vs Runtime).
+.agent/
 
 # Nested target repos used as fixtures
 hello_world/

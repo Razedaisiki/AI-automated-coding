@@ -1,4 +1,8 @@
-# AGENTS.md — Autonomous Development Supervisor
+> **Source:** `supervisor/resources/parent-policy.md` (packaged with the Supervisor).
+> This file is the Parent Agent's role definition. It is injected via the
+> activation prompt, not read from the target repository's `AGENTS.md`.
+
+# Parent Policy — Autonomous Development Supervisor
 
 ## Role
 

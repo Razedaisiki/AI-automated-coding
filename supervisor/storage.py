@@ -82,6 +82,24 @@ class Layout:
     def agent_plan_path(self) -> Path:
         return self.base / ".agent" / "PLAN.md"
 
+    @property
+    def task_path(self) -> Path:
+        """已废弃：Task 源由 [task].file 配置（默认 .supervisor/task.md）。
+        保留作向后兼容，实际路径通过 Layout.task_file(config) 解析。"""
+        return self.base / "TASK.md"
+
+    def task_file(self, config=None) -> Path:
+        """解析 Task 文件路径（支持 [task].file，默认 .supervisor/task.md）。"""
+        raw = None
+        if config is not None and getattr(config, "task", None) is not None:
+            raw = getattr(config.task, "file", None)
+        if not raw:
+            raw = ".supervisor/task.md"
+        p = Path(raw)
+        if p.is_absolute():
+            return p
+        return self.base / p
+
     # Supervisor 世界（只写）
     @property
     def supervisor_dir(self) -> Path:
@@ -124,7 +142,8 @@ class Layout:
         self.supervisor_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.inbox_dir.mkdir(parents=True, exist_ok=True)
-        self.agent_state_path.parent.mkdir(parents=True, exist_ok=True)
+        # .agent/ 不再预创建：首次 checkpoint 时 mkdir -p .agent
+        # 保持“刚 init 完 .agent 为空/不存在”的干净状态
 
 
 class RuntimeStore:

@@ -11,6 +11,27 @@
 
 ---
 
+## 0. 命名空间原则（Source vs Runtime）
+
+> **Supervisor source tree must never contain live runtime control files
+> using the same reserved paths consumed from a target workspace.**
+
+Supervisor 自身源码仓库**不得**携带会被目标运行时识别为"当前任务/当前状态"
+的活跃控制文件。混淆会导致 self-hosting 冲突：用另一个 coding agent 维护
+Supervisor 源码时，agent 会把产品运行时文件当成自己的任务指令。
+
+因此：
+
+- Supervisor 源码中可提交的是**产品资源与配置模板**（`supervisor/resources/`、
+  `supervisor.toml.example`、`docs/` 等）。
+- 目标仓库的运行时状态（`.agent/`、`.supervisor/`、task 文件）永远由
+  `supervisor init` / 首次 activation 在目标仓库内创建，**不在 Supervisor
+  源码仓库中版本控制**。
+- `AGENTS.md` 属于**目标仓库（用户）**，Supervisor 不拥有它；Parent 策略通过
+  `supervisor/resources/parent-policy.md` 经 prompt 注入。
+
+---
+
 ## 1. 职责边界
 
 ### Supervisor 负责（WHEN）
@@ -37,18 +58,23 @@ Supervisor 只用只读探测：`rev-parse`、`symbolic-ref`、`status --porcela
 
 ## 2. 文件所有权（最重要的规则）
 
-| 文件 | 谁写 | 谁读 | 描述 |
-|---|---|---|---|
-| `.agent/state.json` | **Parent** | Supervisor（只读） | 开发任务做到哪了 |
-| `.agent/PLAN.md` | Parent | Supervisor 不解析（只传 "read it"） | 开发计划 |
-| `.agent/STATE.md` | Parent | Parent | Parent 自己的文档工作流 |
-| `.supervisor/runtime.json` | **Supervisor** | Supervisor | 自动化系统运行到哪了 |
-| `.supervisor/events.jsonl` | Supervisor | 任何人 | 只追加的事件日志 |
-| `.supervisor/lock` | Supervisor | Supervisor | 独占锁（Supervisor 唯一性） |
-| `.supervisor/parent.lock` | Supervisor | Supervisor | **Parent 唯一性租约**（flock；由 launcher→exec 后的 DSH 继承持有） |
-| `.supervisor/runs/activation-NNNNNN/` | Supervisor | 任何人 | 每轮 Parent 的运行审计目录 |
-| `.supervisor/inbox/` | Supervisor | Parent | 交给 Parent 的资料（如 CI failed 材料） |
-| `supervisor.toml` | 人 / `supervisor init` | Supervisor | 配置 |
+| 文件 | Owner | 谁写 | 是否 Git tracked | 描述 |
+|---|---|---|---:|---|
+| 项目源码 | Target repo | 人/Parent | ✅ | 目标仓库的所有代码 |
+| `AGENTS.md` | Target repo / user | 人 | ✅ 可选 | 目标仓库的 agent 补充说明（非 Supervisor 策略） |
+| `supervisor.toml` | Target repo / user | 人 / `supervisor init` | ✅ 可选 | 配置（`[task].file` 指定 task 源，默认 `.supervisor/task.md`） |
+| `supervisor/resources/parent-policy.md` | Supervisor package | Supervisor 维护者 | ✅ | Parent 角色/委托/验证/完成策略（经 prompt 注入） |
+| `supervisor/resources/agent-state.schema.json` | Supervisor package | Supervisor 维护者 | ✅ | `agent/state.json` 示例 schema |
+| `.supervisor/task.md` | Supervisor / User | 人（或 `supervisor init --task`） | ❌ | 任务描述（可经 `supervisor.toml [task].file` 配置） |
+| `.agent/PLAN.md` | Parent | Parent | ❌ | 开发计划 |
+| `.agent/STATE.md` | Parent | Parent | ❌ | Parent 自己的文档工作流 |
+| `.agent/state.json` | Parent | Parent | ❌ | 开发任务做到哪了（Supervisor 只读） |
+| `.supervisor/runtime.json` | Supervisor | Supervisor | ❌ | 自动化系统运行到哪了 |
+| `.supervisor/events.jsonl` | Supervisor | Supervisor | ❌ | 只追加的事件日志 |
+| `.supervisor/lock` | Supervisor | Supervisor | ❌ | 独占锁（Supervisor 唯一性） |
+| `.supervisor/parent.lock` | Supervisor | Supervisor | ❌ | **Parent 唯一性租约**（flock；由 launcher→exec 后的 DSH 继承持有） |
+| `.supervisor/runs/activation-NNNNNN/` | Supervisor | Supervisor | ❌ | 每轮 Parent 的运行审计目录 |
+| `.supervisor/inbox/` | Supervisor | Supervisor | ❌ | 交给 Parent 的资料（如 CI failed 材料） |
 
 两个角色**永不写同一个文件**。`runtime.json` 永远只能由 Supervisor 原子写。
 

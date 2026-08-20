@@ -26,6 +26,9 @@ def toml_from_config(cfg: Config) -> str:
     lines.append(f'executable = "{cfg.dsh.executable}"')
     lines.append(f'profile = "{cfg.dsh.profile}"')
     lines.append("")
+    lines.append("[task]")
+    lines.append(f'file = "{cfg.task.file}"')
+    lines.append("")
     lines.append("[limits]")
     for key, value in cfg.limits.__dict__.items():
         lines.append(f"{key} = {value}")
@@ -45,20 +48,33 @@ def toml_from_config(cfg: Config) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _ensure_task_file(repo: Path, cfg: Config) -> Path:
+    """在测试 repo 中创建 task 文件（若不存在），与 CLI init --task 保持一致。"""
+    p = repo / cfg.task.file
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("# Task\n\nImplement the feature and add tests.\n", encoding="utf-8")
+    return p
+
+
 def write_repo_toml(repo: Path, cfg: Config, fake_dsh: bool = False) -> Path:
     if fake_dsh:
         cfg.dsh.executable = str(FAKE_DSH)
     path = repo / "supervisor.toml"
     path.write_text(toml_from_config(cfg), encoding="utf-8")
+    _ensure_task_file(repo, cfg)
     return path
 
 
 @pytest.fixture
 def tmp_repo(tmp_path):
-    """带 .supervisor/ 的空仓库目录。"""
+    """带 .supervisor/ 的空仓库目录（含默认 task 文件，满足 run 前置检查）。"""
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".supervisor").mkdir(parents=True)
+    # 默认 task 文件与 supervisor.toml [task].file 保持一致
+    cfg = default_config()
+    _ensure_task_file(repo, cfg)
     return repo
 
 

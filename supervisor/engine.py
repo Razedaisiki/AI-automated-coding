@@ -861,7 +861,8 @@ class SupervisorEngine:
         run_dir.mkdir(parents=True, exist_ok=True)
 
         git_before = capture_git(self.base)
-        prompt = build_prompt(reason)
+        task_file = self.layout.task_file(self.config).relative_to(self.base).as_posix()
+        prompt = build_prompt(reason, task_file=task_file)
         (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
         prev_seq = self.rt.last_agent_checkpoint_seq
