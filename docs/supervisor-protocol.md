@@ -353,6 +353,10 @@ INVALID_AGENT_STATE | SUPERVISOR_INTERNAL_ERROR | OPERATOR_STOP
   仍为 True，则**必须 fail-closed**（`PARENT_KILL_FAILED` /
   `UNVERIFIABLE_PROCESS_GROUP` → `STOPPED_ERROR + keep_parent`），
   绝不能视为清理成功而继续 spawn（宁可留给 operator）。
+- `supervisor.toml [task].file` 与 CLI `--task` 均为 repo-relative；含 `..` 的
+  路径逃逸在配置解析与 `Layout.task_file()` 两层被拒绝；`AGENTS.md` 属于目标
+  仓库（可选补充说明），Supervisor 的 Parent 策略仅通过
+  `supervisor/resources/parent-policy.md` 注入，不要求目标仓库覆盖 `AGENTS.md`。
 - 统一的 stop 收尾 reconciliation：无论 STOPPING 来自“崩溃后恢复”还是“当前进程
   刚收到 SIGTERM 取消激活”，都走同一套 —— PID 已验证 → 杀组；PID 未知 →
   `process.json`（token 匹配）；record 未知 → `parent.lock` 租约；确认没有

@@ -82,14 +82,12 @@ class Layout:
     def agent_plan_path(self) -> Path:
         return self.base / ".agent" / "PLAN.md"
 
-    @property
-    def task_path(self) -> Path:
-        """已废弃：Task 源由 [task].file 配置（默认 .supervisor/task.md）。
-        保留作向后兼容，实际路径通过 Layout.task_file(config) 解析。"""
-        return self.base / "TASK.md"
-
     def task_file(self, config=None) -> Path:
-        """解析 Task 文件路径（支持 [task].file，默认 .supervisor/task.md）。"""
+        """解析 Task 文件路径（支持 [task].file，默认 .supervisor/task.md）。
+
+        Returns a canonical repo-relative-resolved path and guarantees it
+        stays inside the target repository (no ``..`` escape).
+        """
         raw = None
         if config is not None and getattr(config, "task", None) is not None:
             raw = getattr(config.task, "file", None)
@@ -98,6 +96,15 @@ class Layout:
         p = Path(raw)
         if p.is_absolute():
             return p
+        # Reject path traversal that escapes the repository (e.g. "../../other/TASK.md")
+        # Config already validates this for file-based config, but Layout must also
+        # enforce it for programmatic callers (tests, CLI overrides).
+        if ".." in p.parts:
+            candidate = (self.base / p).resolve()
+            try:
+                candidate.relative_to(self.base.resolve())
+            except ValueError:
+                raise ValueError(f"task file escapes repository: {raw!r}")
         return self.base / p
 
     # Supervisor 世界（只写）

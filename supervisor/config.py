@@ -202,6 +202,10 @@ def _build_task(sec_raw: Any) -> TaskConfig:
         raise ConfigError(f"config [task].file must be a non-empty string, got {raw!r}")
     if raw.strip().startswith("/"):
         raise ConfigError("config [task].file must be a repo-relative path, not absolute")
+    # Reject path traversal that would escape the target repository
+    tmp = Path(raw.strip())
+    if ".." in tmp.parts:
+        raise ConfigError(f"config [task].file must not escape repository: {raw!r}")
     return TaskConfig(file=raw.strip())
 
 

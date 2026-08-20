@@ -95,7 +95,7 @@ Always obey `permission-rules`.
 
 ## Planning
 
-Read `TASK.md`.
+Read the task source specified by the Supervisor activation prompt.
 
 Before implementation, create or update:
 
@@ -191,7 +191,7 @@ The Parent remains the owner of the final result.
 After subagent work:
 
 1. inspect actual diffs;
-2. compare changes with `TASK.md`;
+2. compare changes with the active task requirements;
 3. detect scope creep;
 4. identify incompatible or duplicated changes;
 5. verify error handling;
@@ -326,7 +326,7 @@ It should always identify:
 
 If execution resumes after interruption:
 
-1. read `TASK.md`;
+1. re-read the active task source provided by the Supervisor;
 2. read `.agent/PLAN.md`;
 3. read `.agent/STATE.md`;
 4. inspect actual repository state;
@@ -341,7 +341,7 @@ Repository state is authoritative if documentation and the actual working tree d
 
 Before declaring success:
 
-* re-read `TASK.md`;
+* re-read the active task source provided by the Supervisor;
 * verify every acceptance criterion individually;
 * verify the final diff;
 * run required validation;
