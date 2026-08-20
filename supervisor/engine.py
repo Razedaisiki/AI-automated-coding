@@ -580,11 +580,8 @@ class SupervisorEngine:
         return GitHubCiProvider()
 
     def _verify_sha_exists(self, sha: str) -> bool:
-        # When CI is enabled, WAIT_CI requires the SHA to be a local commit
-        # regardless of repo type. Non-Git repos with ci.enabled must fail
-        # closed (fail-open would accept fake SHAs). The caller handles
-        # ci.enabled==false separately.
-        r = subprocess.run(["git", "rev-parse", "--verify", sha], cwd=str(self.base), capture_output=True, timeout=5)
+        # Must be an existing *commit* object, not any object type.
+        r = subprocess.run(["git", "rev-parse", "--verify", f"{sha}^{{commit}}"], cwd=str(self.base), capture_output=True, timeout=5)
         return r.returncode == 0
 
     async def _backoff(self, reason) -> None:

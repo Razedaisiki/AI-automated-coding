@@ -136,9 +136,10 @@ class HumanEventStore:
             if e.status not in ("PENDING", "DELIVERING"):
                 continue
             if gate_id is not None:
-                # Gate-scoped consumption: only events bound to this gate, or
-                # unbound legacy events (gate_id is None) for back-compat.
-                if e.gate_id is not None and e.gate_id != gate_id:
+                # Mandatory gate binding: event must be bound to this exact gate.
+                # Unbound events (gate_id is None) are legacy/mis-bound and must
+                # NOT be consumed as approvals for a future gate.
+                if e.gate_id != gate_id:
                     continue
             return e
         return None

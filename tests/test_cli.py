@@ -130,14 +130,26 @@ class TestStatusEventsResume:
         assert "PARENT_STARTED" in out
 
     def test_resume_writes_marker(self, tmp_repo):
-        rc = main(["resume", str(tmp_repo), "--event", "HUMAN_APPROVED"])
-        assert rc == 0
-        # New CLI writes to HumanEventStore, not legacy resume.json
+        # Gate-bound resume: must be WAITING_HUMAN
+        from supervisor.config import default_config
+        from supervisor.engine import SupervisorEngine
         from supervisor.human_events import HumanEventStore
         from supervisor.storage import Layout as _Layout
-        store = HumanEventStore(_Layout(tmp_repo).human_inbox_dir)
-        evts = store.list_all()
-        assert len(evts) == 1 and evts[0].event_type == "HUMAN_APPROVED"
+        from conftest import FakeParentRunner, Step, event_names, run_engine, wait_until
+        cfg = default_config()
+        cfg.restart.backoff_seconds = [0.01]
+        runner = FakeParentRunner([Step(status="WAIT_HUMAN"), Step(status="COMPLETED")], _Layout(tmp_repo))
+        engine = SupervisorEngine(base_dir=tmp_repo, config=cfg, runner=runner)
+        async def control(eng):
+            await wait_until(lambda: "WAIT_HUMAN" in event_names(eng))
+            rc = main(["resume", str(tmp_repo), "--event", "HUMAN_APPROVED"])
+            assert rc == 0
+            store = HumanEventStore(_Layout(tmp_repo).human_inbox_dir)
+            evts = store.list_all()
+            assert len(evts) == 1 and evts[0].event_type == "HUMAN_APPROVED"
+            assert evts[0].gate_id is not None
+        rc = run_engine(engine, control)
+        assert rc == 0
 
     def test_resume_rejects_unknown_event(self, tmp_repo):
         rc = main(["resume", str(tmp_repo), "--event", "NOPE"])

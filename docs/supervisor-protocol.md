@@ -579,9 +579,9 @@ Inspect the repository (git status/diff/log) before continuing.
 ## 16. Human Gate（M8）
 
 - 持久化：`.supervisor/inbox/human/event-XXXX.json` 追加式（`supervisor/human_events.py:HumanEventStore`），**不是**单文件 `resume.json`（`resume.json` 保留为 legacy 兼容 shims，M8 起新事件一律走 inbox/human）。
-- `HumanEvent V1`：`{event_id, event_type: HUMAN_APPROVED|HUMAN_CHANGES_REQUESTED, created_at, message?, attachment_path?, status: PENDING→DELIVERING→DELIVERED}`，`event_id` 单调递增（如 `human-000003`），进入 `event file / runtime / events.jsonl / activation prompt`。
-- CLI：`supervisor resume [repo] --event HUMAN_APPROVED [--message TEXT] [--file feedback.md]`；`--file` 复制进 `inbox/human/attachments/<event_id>/`。
-- FSM：`WAIT_HUMAN` 期间不启动 Parent，直到 durable event 出现；`PENDING → DELIVERING（事件被选中后落盘 runtime.human_event_id） → DELIVERED（该事件对应的 Parent activation 完成退出后）`，`DELIVERING` 重启后可重试（同一 `event_id` 可能触发第二次 activation，需 Parent 侧幂等处理），绝不静默丢失；`active wall-time` 在 `WAITING_HUMAN` 且 `pause_active_wall_clock=true` 时暂停。
+- `HumanEvent V1`：`{event_id, event_type: HUMAN_APPROVED|HUMAN_CHANGES_REQUESTED, created_at, message?, attachment_path?, gate_id, status: PENDING→DELIVERING→DELIVERED}`，`event_id` 单调递增（如 `human-000003`），`gate_id` 强制绑定到触发该事件的 `human_gate.gate_id`，进入 `event file / runtime / events.jsonl / activation prompt`。
+- CLI：`supervisor resume [repo] --event HUMAN_APPROVED [--message TEXT] [--file feedback.md] [--gate-id GATE]`；`--file` 复制进 `inbox/human/attachments/<event_id>/`。默认自动绑定当前 `WAITING_HUMAN` 的 `human_gate.gate_id`；非 `WAITING_HUMAN` 时拒绝（不产生可被未来 gate 误消费的未绑定事件）；`--gate-id` 显式绑定时校验与当前 gate 一致。
+- FSM：`WAIT_HUMAN` 期间不启动 Parent，直到 durable **gate-bound** event 出现；`PENDING → DELIVERING（事件被选中后落盘 runtime.human_event_id） → DELIVERED（该事件对应的 Parent activation 完成退出后）`，`DELIVERING` 重启后可重试（同一 `event_id` 可能触发第二次 activation，需 Parent 侧幂等处理），绝不静默丢失；未绑定或错 gate 的事件对当前 gate 不可见（`next_pending(gate_id)` 强制精确匹配）；`active wall-time` 在 `WAITING_HUMAN` 且 `pause_active_wall_clock=true` 时暂停。
 - 事件幂等：同一 `event_id` 可重试交付，但 `HumanEventStore` 按追加顺序 FIFO 去重；Parent 必须对同一 `event_id` 的重复交付结果幂等（检查已应用的变更/已存在的 review 状态）。
 
 ## 17. Parent Delivery Contract（M9）
