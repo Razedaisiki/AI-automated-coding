@@ -423,18 +423,186 @@ BOOT → 拿独占锁 → 读 runtime.json → 读 .agent/state.json
 
 ---
 
-## 14. CI / Human（后续里程碑）
+## 14. Git Observation Contract（M6）
 
-- CI 必须绑定 SHA，绝不看 branch 最新 CI。
-- CI 结果统一映射：`NOT_FOUND PENDING SUCCESS FAILURE CANCELLED ERROR`。
-- CI 失败：收集材料到 `.supervisor/inbox/ci-<sha>/`，只把路径写进 prompt。
-- CI 日志视作 untrusted data：限制大小、不解释、只保存并交给 Parent。
-- WAIT_HUMAN：Supervisor 停止 Parent，`supervisor resume --event ...` 续跑。
-- M7/M8 之前：`[ci] enabled = false`。
+### 14.1 目标
+
+Supervisor 能够机械回答：
+
+```
+is_git_repo / branch / head / detached_head / dirty / has_remote / remote_url
+activation before / after 的机械差异
+```
+
+但**绝不**分析 diff 内容、判断功能是否完成、评价代码质量。
+
+### 14.2 允许 / 禁止的 Git 命令
+
+**允许（只读探测）：**
+
+```
+git rev-parse --is-inside-work-tree
+git rev-parse HEAD
+git rev-parse --verify <sha>
+git symbolic-ref --short HEAD
+git status --porcelain
+git remote
+git remote get-url <name>
+```
+
+**禁止（任何仓库 mutation）：**
+
+```
+git add / commit / reset / checkout（改变 working tree） / merge / rebase
+git push / clean / restore（mutation 形式）
+```
+
+任何 `add/commit/checkout/reset/merge/rebase/push` 均属于 Parent 行为，Supervisor 绝不执行。
+
+### 14.3 GitSnapshot V1 冻结 Schema
+
+```json
+{
+  "is_git_repo": true,
+  "branch": "feature/foo",
+  "head": "abc123... (40-char SHA)",
+  "detached_head": false,
+  "dirty": true,
+  "has_remote": true,
+  "remote_url": "https://..."
+}
+```
+
+非 Git 仓库：
+
+```json
+{
+  "is_git_repo": false,
+  "branch": null,
+  "head": null,
+  "detached_head": false,
+  "dirty": false,
+  "has_remote": false,
+  "remote_url": null
+}
+```
+
+字段语义：
+
+| 字段 | 语义 |
+|---|---|
+| `is_git_repo` | `git rev-parse --is-inside-work-tree == true`；false 时其余字段为 null/false，Supervisor 不 crash |
+| `branch` | 正常 branch 名；detached HEAD 时 `null` |
+| `detached_head` | 是否 detached HEAD（`branch is null && is_git_repo && head != null`）；独立 bool，不让消费者猜 |
+| `head` | 完整 40-char commit SHA；无法获得则 `null` |
+| `dirty` | working tree/index 是否有 Git-visible changes（`status --porcelain` 非空）；不记录原因/文件/diff |
+| `has_remote` | 是否存在至少一个 configured remote（**不是** `has_origin`）；`remote_url` 优先 `origin`，无 origin 则取确定性的第一个 remote（按 `git remote` 排序首个），否则 `null` |
+
+`GitSnapshot` 位于 `supervisor/models.py`，`capture()` 位于 `supervisor/git_probe.py`，`compare_git_snapshots()` 提供纯机械比较（`head_changed/dirty_changed/branch_changed/remote_changed/detached_changed`），绝不推断业务语义。
+
+### 14.4 Snapshot 生命周期与持久化
+
+| 时机 | 路径 | 形式 |
+|---|---|---|
+| Supervisor startup | `.supervisor/git-startup.json` | `atomic_write_json`（`supervisor/storage.py:Layout.git_startup_path`）|
+| 每次 activation before | `.supervisor/runs/activation-NNNNNN/git-before.json` | **crash-safe：先 capture → 原子落盘 → 再 spawn Parent** |
+| 每次 activation after | `.supervisor/runs/activation-NNNNNN/git-after.json` | after capture 后原子落盘 |
+
+`git-before.json` 的正确顺序（correctness invariant）：
+
+```
+allocate run_dir
+→ capture git_before
+→ atomic write git-before.json + fsync
+→ persist STARTING_PARENT + PARENT_STARTING
+→ spawn Parent
+```
+
+绝不能 `capture before → spawn → 完成后才写 before`，否则 `capture → kill -9 Supervisor` 会丢失 before evidence。
+
+`git-startup.json` 用于 `Supervisor restart` 诊断与 recovery 上下文（见 §11 运行目录）。
+
+### 14.5 Git Comparison
+
+`compare_git_snapshots(before, after)` 只能得出：
+
+```
+HEAD changed / unchanged
+dirty changed / unchanged
+branch changed / unchanged
+remote changed / unchanged
+```
+
+不得得出 `feature completed / bug introduced / dangerous diff`。
+
+### 14.6 Git 事件
+
+M6 增加机械事件（`supervisor/events.py`）：
+
+```
+GIT_SNAPSHOT         phase=startup|before|after + 全量字段
+GIT_HEAD_CHANGED     activation + before/after SHA
+GIT_DIRTY_CHANGED    activation + before/after dirty
+GIT_BRANCH_CHANGED   activation + before/after branch
+```
+
+仅记录事实。
+
+### 14.7 Recovery Context
+
+Parent crash / Supervisor recovery 后，若存在 durable Git evidence（`git-before.json` / `git-after.json` / 当前 `capture`），recovery prompt 可中性告知 Parent：
+
+```
+Previous activation changed mechanical Git state.
+Before: HEAD=... dirty=...
+Current: HEAD=... dirty=...
+Inspect the repository (git status/diff/log) before continuing.
+```
+
+Parent 自行执行 `git status/diff/log` 判断；Supervisor 绝不嵌入 diff 内容。
 
 ---
 
-## 15. 里程碑落点（M0–M5）
+## 15. CI Waiting Contract（M7）
+
+- CI 必须绑定 **exact commit SHA**，绝不看 branch 最新 CI。
+- CI 状态统一映射：`NOT_FOUND | PENDING | SUCCESS | FAILURE | CANCELLED | ERROR | TIMEOUT`（`supervisor/models.py:CiStatus`）。
+- `CiObservation` / `CiMaterial` 定义见 `supervisor/ci/base.py`；字段仅用于 identity/state/diagnostics。
+- 超时与轮询：`[ci] poll_seconds > 0`、`discovery_grace_seconds >= 0`、`max_wait_seconds > 0`；`NOT_FOUND` 在 `discovery_grace_seconds` 内继续等待，超出则按 `TIMEOUT` 处理。
+- 等待循环：`WAITING_CI` → `get_status(exact SHA)` → `NOT_FOUND(grace 内继续) / PENDING / SUCCESS(→ CI_SUCCEEDED) / FAILURE(→ collect → CI_FAILED) / CANCELLED|ERROR|TIMEOUT`。
+- `SUCCESS != COMPLETED`：Supervisor 绝不自行完成任务。
+- Durability：`runtime.json: ci_wait {sha, provider, started_at, last_status, last_observed_at}`，`kill -9` 重启后继续等待同一 SHA，不启动普通 Parent。
+- Inbox：`.supervisor/inbox/ci-<sha>/{observation.json, summary.txt, failed-jobs.json, logs/}`，幂等、crash-safe、有界（单文件 2 MiB 截断）。
+- 日志为 untrusted data：只保存/size cap/safe decode/truncate + metadata，不解释、不执行；Parent prompt 仅写材料路径。
+- `ci_wait` 仅在 `WAITING_CI` 时存在；离开该状态后清空。
+
+## 16. Human Gate（M8）
+
+- 持久化：`.supervisor/inbox/human/event-XXXX.json` 追加式（`supervisor/human_events.py:HumanEventStore`），**不是**单文件 `resume.json`（`resume.json` 保留为 legacy 兼容 shims，M8 起新事件一律走 inbox/human）。
+- `HumanEvent V1`：`{event_id, event_type: HUMAN_APPROVED|HUMAN_CHANGES_REQUESTED, created_at, message?, attachment_path?, status: PENDING→DELIVERING→DELIVERED}`，`event_id` 单调递增（如 `human-000003`），进入 `event file / runtime / events.jsonl / activation prompt`。
+- CLI：`supervisor resume [repo] --event HUMAN_APPROVED [--message TEXT] [--file feedback.md]`；`--file` 复制进 `inbox/human/attachments/<event_id>/`。
+- FSM：`WAIT_HUMAN` 期间不启动 Parent，直到 durable event 出现；`PENDING → DELIVERING（落盘 runtime.human_event_id + PARENT_STARTING） → DELIVERED（PARENT_STARTED 后）`，`DELIVERING` 重启后可重试，绝不静默丢失；`active wall-time` 在 `WAITING_HUMAN` 且 `pause_active_wall_clock=true` 时暂停。
+- 事件幂等：同一 `event_id` 可重试交付，但 `HumanEventStore` 按追加顺序 FIFO 去重。
+
+## 17. Parent Delivery Contract（M9）
+
+- 标准链路（`supervisor/resources/parent-policy.md` 冻结）：`Read task → AGENTS.md → Inspect repo → acceptance criteria(PLAN) → decomposition → subagents → Implementation → inspect diff → targeted tests → format → typecheck → lint → build → broader tests → doublecheck → commit → push → WAIT_CI`。工具缺失则跳过对应校验。
+- 子代理契约：仅边界清晰、验收明确、ownership 不冲突的任务才委派；每个委派含 `目标/范围内/范围外/验收/验证`。
+- Parent 不得盲信 subagent：必须检查实际 diff 后才 commit。
+- Fresh reviewer：实现后由独立 reviewer 检查 `correctness/edge cases/regression/security/compatibility`，Parent 决定 `accept/fix/re-review`。
+- `WAIT_CI` 准入：`local validation passed + commit exists + push completed + exact SHA known + git.head == ci.sha && git.pushed_head == ci.sha（若提供）`，否则 `AgentStateError → STOPPED_ERROR`（`supervisor/models.py:AgentState.from_dict` 强制校验）。
+
+## 18. PR / Review Loop（M10）
+
+- 归属：`create/find/update PR、title/body、read review、repair、merge（仅当 policy 授权）` 均属 Parent；Supervisor 仅持久化 `review` 机械引用。
+- 幂等：同一 delivery lane 必须 `lookup existing PR → reuse/update`，禁止 `blind create` 导致 crash-recovery 后重复 PR。
+- `review` 字段（`agent/state.json` 可选）：`{provider, pr_number, pr_url, head_sha}`，仅机械引用，Supervisor 校验 `pr_number:int, pr_url:str, head_sha:hex`，不解释内容。
+- 循环：`WAIT_CI→CI_SUCCESS→Parent PR→WAIT_HUMAN→HUMAN_CHANGES_REQUESTED→repair→WAIT_CI(new SHA)→CI_SUCCESS→update PR→WAIT_HUMAN→HUMAN_APPROVED→Parent verify delivery→COMPLETED`；支持多轮 `changes-requested`。
+- `COMPLETED` 仅 Parent 确认 `acceptance criteria + CI + human gate` 后写入；`CI success` 与 `human approval` 均不自动等同 `COMPLETED`。Supervisor 绝不替 Parent `merge`。
+
+---
+
+## 19. 里程碑落点（M0–M5）
 
 - 前 3 分钟 CI `NOT_FOUND` 不算失败（discovery grace）—— M7。
 - Token/cost 不做假硬限额（不按字符串长度乘价格）—— V2。

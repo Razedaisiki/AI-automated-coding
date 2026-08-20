@@ -158,13 +158,13 @@ _CI_SUCCEEDED = (
 
 _HUMAN_APPROVED = (
     "SUPERVISOR EVENT: HUMAN_APPROVED\n"
-    "\n"
+    "{human_ctx}"
     "A human approved the current state. Resume the existing task."
 )
 
 _HUMAN_CHANGES_REQUESTED = (
     "SUPERVISOR EVENT: HUMAN_CHANGES_REQUESTED\n"
-    "\n"
+    "{human_ctx}"
     "A human requested changes. Inspect the feedback recorded by the human, "
     "then resume the existing task."
 )
@@ -192,15 +192,29 @@ def build_prompt(reason: str, task_file: str = ".supervisor/task.md", **ctx) -> 
     template = _PROMPTS.get(reason)
     if template is None:
         raise ValueError(f"unknown supervisor event: {reason!r}")
-    # 填充 task_file 与 CI 上下文
+    if "{human_ctx}" in template:
+        human_ctx = ""
+        if ctx.get("human_event_id"):
+            human_ctx += f"Human event: {ctx['human_event_id']}\n"
+        if ctx.get("human_message"):
+            human_ctx += f"Human message: {ctx['human_message']}\n"
+        if ctx.get("human_attachment"):
+            human_ctx += f"Human attachment: {ctx['human_attachment']}\n"
+        if ctx.get("review_pr_number"):
+            human_ctx += f"PR: #{ctx['review_pr_number']} {ctx.get('review_pr_url','')}\n"
+        if human_ctx:
+            human_ctx += "\n"
+        ctx = dict(ctx, human_ctx=human_ctx)
     if "{task_file}" in template:
         prompt = template.format(task_file=task_file, **{k: v for k, v in ctx.items() if k in template})
-        # 处理剩余占位符（sha, ci_dir）
         if "{sha}" in prompt or "{ci_dir}" in prompt:
             prompt = prompt.format(sha=ctx.get("sha", "?"), ci_dir=ctx.get("ci_dir", ".supervisor/inbox"))
         return _inject_policy(prompt)
     if "{sha}" in template or "{ci_dir}" in template:
         prompt = template.format(sha=ctx.get("sha", "?"), ci_dir=ctx.get("ci_dir", ".supervisor/inbox"))
+        return _inject_policy(prompt)
+    if "{human_ctx}" in template:
+        prompt = template.format(**{k: v for k, v in ctx.items() if k in template})
         return _inject_policy(prompt)
     return _inject_policy(template)
 

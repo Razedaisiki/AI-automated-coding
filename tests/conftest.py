@@ -17,7 +17,15 @@ from supervisor.storage import Layout
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 FAKE_DSH = PROJECT_DIR / "tests" / "fixtures" / "fake_dsh.py"
 
-TEMPLATE_TOML = (PROJECT_DIR / "supervisor.toml").read_text(encoding="utf-8")
+_TOML_CANDIDATES = [
+    PROJECT_DIR / "supervisor.toml",
+    PROJECT_DIR / "supervisor.toml.example",
+]
+_TOML_SRC = next((p for p in _TOML_CANDIDATES if p.exists()), None)
+if _TOML_SRC is not None:
+    TEMPLATE_TOML = _TOML_SRC.read_text(encoding="utf-8")
+else:
+    TEMPLATE_TOML = toml_from_config(default_config())
 
 
 def toml_from_config(cfg: Config) -> str:

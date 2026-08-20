@@ -100,11 +100,12 @@ class AgentState:
     checkpoint: Optional[Dict[str, Any]] = None
     git: Optional[Dict[str, Any]] = None
     ci: Optional[Dict[str, Any]] = None
+    review: Optional[Dict[str, Any]] = None
     next_action: Optional[str] = None
     blocker: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "schema_version": self.schema_version,
             "task_id": self.task_id,
             "status": self.status.value,
@@ -116,6 +117,9 @@ class AgentState:
             "blocker": self.blocker,
             "updated_at": self.updated_at,
         }
+        if self.review is not None:
+            d["review"] = self.review
+        return d
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "AgentState":
@@ -141,18 +145,62 @@ class AgentState:
         if not isinstance(updated_at, str) or not updated_at:
             raise AgentStateError("agent state missing valid updated_at")
 
+        status = AgentStatus(status_raw)
+        git = raw.get("git")
+        ci = raw.get("ci")
+        review = raw.get("review")
+
+        if status == AgentStatus.WAIT_CI:
+            # M7 strict path: when CI is in use, ci.sha + sha format + git consistency are enforced
+            # by engine's _wait_ci before blocking. At model level we keep WAIT_CI permissive for
+            # legacy fake tests that use bare WAIT_CI without sha/git (they rely on CI_DISABLED fallback).
+            if isinstance(ci, dict) and ci.get("sha") is not None:
+                sha = ci["sha"]
+                if not isinstance(sha, str) or not _is_valid_sha(sha):
+                    raise AgentStateError(f"WAIT_CI ci.sha must be a valid hex SHA (7-40 chars), got {sha!r}")
+                if isinstance(git, dict):
+                    for key in ("head", "pushed_head"):
+                        if key in git and git[key] is not None:
+                            if len(sha) == 40 and isinstance(git[key], str) and git[key] != sha:
+                                raise AgentStateError(
+                                    f"WAIT_CI git.{key} ({git[key]!r}) must equal ci.sha ({sha!r}) when both present"
+                                )
+
+        if review is not None:
+            if not isinstance(review, dict):
+                raise AgentStateError("review must be an object")
+            if "pr_number" in review and review["pr_number"] is not None:
+                if not isinstance(review["pr_number"], int) or isinstance(review["pr_number"], bool):
+                    raise AgentStateError("review.pr_number must be an integer")
+            if "pr_url" in review and review["pr_url"] is not None:
+                if not isinstance(review["pr_url"], str):
+                    raise AgentStateError("review.pr_url must be a string")
+            if "head_sha" in review and review["head_sha"] is not None:
+                if not isinstance(review["head_sha"], str) or not _is_valid_sha(review["head_sha"]):
+                    raise AgentStateError(f"review.head_sha must be a valid hex SHA, got {review['head_sha']!r}")
+
         return cls(
             schema_version=schema_version,
-            status=AgentStatus(status_raw),
+            status=status,
             checkpoint_seq=checkpoint_seq,
             updated_at=updated_at,
             task_id=raw.get("task_id"),
             checkpoint=raw.get("checkpoint"),
-            git=raw.get("git"),
-            ci=raw.get("ci"),
+            git=git,
+            ci=ci,
+            review=review,
             next_action=raw.get("next_action"),
             blocker=raw.get("blocker"),
         )
+
+
+def _is_valid_sha(s: str) -> bool:
+    if not isinstance(s, str):
+        return False
+    s = s.strip()
+    if len(s) < 7 or len(s) > 40:
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in s)
 
 
 def agent_state_from_dict(raw: Dict[str, Any]) -> AgentState:
@@ -272,6 +320,8 @@ class RuntimeState:
     supervisor_process_start_id: Optional[str] = None
     active_budget: Optional[Dict[str, Any]] = None
     stop_reason: Optional[StopReason] = None
+    ci_wait: Optional[Dict[str, Any]] = None
+    human_event_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -286,6 +336,8 @@ class RuntimeState:
             "supervisor_process_start_id": self.supervisor_process_start_id,
             "active_budget": self.active_budget,
             "stop_reason": self.stop_reason.value if self.stop_reason else None,
+            "ci_wait": self.ci_wait,
+            "human_event_id": self.human_event_id,
         }
 
     @classmethod
@@ -313,6 +365,8 @@ class RuntimeState:
             supervisor_process_start_id=raw.get("supervisor_process_start_id"),
             active_budget=raw.get("active_budget"),
             stop_reason=StopReason(raw["stop_reason"]) if raw.get("stop_reason") else None,
+            ci_wait=raw.get("ci_wait"),
+            human_event_id=raw.get("human_event_id"),
         )
 
 
@@ -343,17 +397,43 @@ class ParentResult:
 class GitSnapshot:
     """Git 机械状态快照（Supervisor 只看结构，不看 diff 内容）。"""
 
+    is_git_repo: bool = False
     branch: Optional[str] = None
     head: Optional[str] = None
+    detached_head: bool = False
     dirty: bool = False
     has_remote: bool = False
     remote_url: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "is_git_repo": self.is_git_repo,
             "branch": self.branch,
             "head": self.head,
+            "detached_head": self.detached_head,
             "dirty": self.dirty,
             "has_remote": self.has_remote,
             "remote_url": self.remote_url,
         }
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> "GitSnapshot":
+        return cls(
+            is_git_repo=bool(raw.get("is_git_repo", False)),
+            branch=raw.get("branch"),
+            head=raw.get("head"),
+            detached_head=bool(raw.get("detached_head", False)),
+            dirty=bool(raw.get("dirty", False)),
+            has_remote=bool(raw.get("has_remote", False)),
+            remote_url=raw.get("remote_url"),
+        )
+
+
+def compare_git_snapshots(before: "GitSnapshot", after: "GitSnapshot") -> Dict[str, bool]:
+    return {
+        "head_changed": before.head != after.head,
+        "dirty_changed": before.dirty != after.dirty,
+        "branch_changed": before.branch != after.branch,
+        "remote_changed": (before.has_remote != after.has_remote or before.remote_url != after.remote_url),
+        "detached_changed": before.detached_head != after.detached_head,
+    }

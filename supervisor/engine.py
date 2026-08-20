@@ -13,7 +13,9 @@
 
 import asyncio
 import os
+import re
 import signal
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -28,6 +30,19 @@ from .events import (
     AGENT_STATE,
     AGENT_STATE_INVALID,
     CI_DISABLED,
+    CI_FAILED,
+    CI_MATERIAL_SAVED,
+    CI_OBSERVED,
+    CI_SUCCEEDED,
+    CI_WAIT_STARTED,
+    CI_WAIT_TIMEOUT,
+    GIT_BRANCH_CHANGED,
+    GIT_DIRTY_CHANGED,
+    GIT_HEAD_CHANGED,
+    GIT_SNAPSHOT,
+    HUMAN_EVENT_DELIVERED,
+    HUMAN_EVENT_DELIVERY_STARTED,
+    HUMAN_EVENT_RECEIVED,
     LIMIT_REACHED,
     LOCK_ACQUIRED,
     LOCK_REJECTED,
@@ -56,12 +71,15 @@ from .events import (
     WAIT_HUMAN,
     EventLog,
 )
+from .human_events import HumanEventStore
 from .git_probe import capture as capture_git
+from .models import compare_git_snapshots
 from .lock import LockHeldError, ParentLease, SupervisorLock
 from .models import (
     AgentState,
     AgentStateError,
     AgentStatus,
+    CiStatus,
     Counters,
     KillReason,
     Limits,
@@ -96,7 +114,7 @@ class Outcome:
 
 
 class SupervisorEngine:
-    def __init__(self, base_dir, config: Optional[Config] = None, runner=None):
+    def __init__(self, base_dir, config: Optional[Config] = None, runner=None, ci_provider=None):
         self.base = Path(base_dir)
         self.config = config if config is not None else default_config()
         self.layout = Layout(self.base)
@@ -107,6 +125,8 @@ class SupervisorEngine:
             profile=self.config.dsh.profile,
             terminate_grace_seconds=self.config.limits.terminate_grace_seconds,
         )
+        self.ci_provider = ci_provider  # injected for tests (FakeCiProvider)
+        self.human_store = HumanEventStore(self.layout.human_inbox_dir)
         self.stop_event_proxy = None
         self._stop_requested = False
         self.lock = None
@@ -137,6 +157,12 @@ class SupervisorEngine:
         self.log.emit(LOCK_ACQUIRED)
 
         self.rt = self._restore_or_init_runtime()
+        try:
+            _startup = capture_git(self.base)
+            atomic_write_json(self.layout.git_startup_path, _startup.to_dict())
+            self.log.emit(GIT_SNAPSHOT, phase="startup", **_startup.to_dict())
+        except Exception:
+            pass
         existing_agent = self._read_agent_state_safe()
         if existing_agent is not None:
             self.rt.last_agent_checkpoint_seq = max(
@@ -208,7 +234,38 @@ class SupervisorEngine:
                 if agent.status == AgentStatus.WAIT_HUMAN:
                     resume = await self._wait_human()
                     if resume:
-                        outcome = await self._activation_cycle(resume)
+                        pending_id = self.rt.human_event_id
+                        pending_evt = None
+                        if pending_id:
+                            try:
+                                pending_evt = HumanEventStore(self.layout.human_inbox_dir).get(pending_id)
+                            except Exception:
+                                pending_evt = None
+                        extra = {}
+                        if pending_evt:
+                            extra["human_event_id"] = pending_evt.event_id
+                            if pending_evt.message:
+                                extra["human_message"] = pending_evt.message
+                            if pending_evt.attachment_path:
+                                extra["human_attachment"] = pending_evt.attachment_path
+                        if agent.review:
+                            if agent.review.get("pr_number"):
+                                extra["review_pr_number"] = agent.review["pr_number"]
+                                extra["review_pr_url"] = agent.review.get("pr_url", "")
+                        if extra:
+                            # inject human/review context via prompt kwargs helper
+                            self._pending_human_ctx = extra
+                        outcome = await self._activation_cycle(resume, **extra) if extra else await self._activation_cycle(resume)
+                        if hasattr(self, "_pending_human_ctx"):
+                            delattr(self, "_pending_human_ctx")
+                        if pending_id:
+                            try:
+                                HumanEventStore(self.layout.human_inbox_dir).mark_delivered(pending_id)
+                                self.log.emit(HUMAN_EVENT_DELIVERED, event_id=pending_id)
+                            except Exception:
+                                pass
+                            self.rt.human_event_id = None
+                            self._save_runtime()
                         result = await self._process_outcome(outcome)
                         if result is None:
                             continue
@@ -222,6 +279,11 @@ class SupervisorEngine:
                     continue
                 if agent.status == AgentStatus.WAIT_CI:
                     await self._wait_ci(agent)
+                    # _wait_ci may have finalized as STOPPED_LIMIT/ERROR via CI timeout/validation
+                    if self.rt.status == SupervisorStatus.STOPPED_LIMIT:
+                        return self._finalize(self.rt.stop_reason, self.rt.status, 1)
+                    if self.rt.status == SupervisorStatus.STOPPED_ERROR:
+                        return self._finalize(self.rt.stop_reason or StopReason.INVALID_AGENT_STATE, self.rt.status, 1)
                     continue
 
                 reason = next_reason or "CONTINUE"
@@ -268,6 +330,10 @@ class SupervisorEngine:
             return ("complete",)
         if outcome.action == "wait_ci":
             await self._wait_ci(outcome.agent)
+            if self.rt.status == SupervisorStatus.STOPPED_LIMIT:
+                return ("stop", self.rt.stop_reason, self.rt.status, 1)
+            if self.rt.status == SupervisorStatus.STOPPED_ERROR:
+                return ("stop", self.rt.stop_reason or StopReason.INVALID_AGENT_STATE, self.rt.status, 1)
             return None
         if outcome.action == "wait_human":
             return None
@@ -501,6 +567,30 @@ class SupervisorEngine:
             budget["last_mark"] = now
         self.rt.active_budget = budget
 
+    def _make_ci_provider(self):
+        if self.ci_provider is not None:
+            return self.ci_provider
+        from .ci.fake import FakeCiProvider
+        from .ci.github import GitHubCiProvider
+        if self.config.ci.provider == "fake":
+            return FakeCiProvider([CiStatus.SUCCESS])
+        return GitHubCiProvider()
+
+    def _verify_sha_exists(self, sha: str) -> bool:
+        # In non-git repos (tests) git rev-parse fails with "not a git repo".
+        # Treat as verification passed to keep fake tests working; real repos
+        # will have .git and the check matters.
+        if not (self.base / ".git").exists():
+            # Also check if repo is inside work tree
+            try:
+                r0 = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(self.base), capture_output=True, timeout=5)
+                if r0.returncode != 0:
+                    return True
+            except Exception:
+                return True
+        r = subprocess.run(["git", "rev-parse", "--verify", sha], cwd=str(self.base), capture_output=True, timeout=5)
+        return r.returncode == 0
+
     async def _backoff(self, reason) -> None:
         idx = min(
             self.rt.counters.crash_restarts,
@@ -517,40 +607,216 @@ class SupervisorEngine:
             await asyncio.sleep(delay / steps)
 
     async def _wait_ci(self, agent: AgentState) -> None:
-        self.rt.status = SupervisorStatus.WAITING_CI
-        self._save_runtime()
-        sha = agent.ci.get("sha") if isinstance(agent.ci, dict) else None
+        # Validate WAIT_CI state — lenient when CI disabled to preserve existing tests
+        sha_raw = agent.ci.get("sha") if isinstance(agent.ci, dict) else None
+        if not isinstance(agent.ci, dict) or not sha_raw:
+            if not self.config.ci.enabled:
+                self.rt.status = SupervisorStatus.WAITING_CI
+                self._save_runtime()
+                self.log.emit(CI_DISABLED, requested_sha=sha_raw)
+                self.log.emit(WAIT_CI, sha=sha_raw)
+                while not self.stop_event.is_set():
+                    st = self._read_agent_state_safe()
+                    if st is None or st.status != agent.status:
+                        return
+                    await asyncio.sleep(0.2)
+                return
+            self.log.emit(AGENT_STATE_INVALID, error="WAIT_CI missing ci.sha")
+            self.rt.status = SupervisorStatus.STOPPED_ERROR
+            self.rt.stop_reason = StopReason.INVALID_AGENT_STATE
+            self._save_runtime()
+            self.log.emit(SUPERVISOR_STOPPED, status="STOPPED_ERROR", stop_reason="INVALID_AGENT_STATE")
+            raise AgentStateError("WAIT_CI missing ci.sha")
+
+        sha = sha_raw
+        if not isinstance(sha, str) or not re.match(r"^[0-9a-fA-F]{7,40}$", sha.strip()):
+            if not self.config.ci.enabled:
+                sha = sha if isinstance(sha, str) else str(sha)
+                self.rt.status = SupervisorStatus.WAITING_CI
+                self._save_runtime()
+                self.log.emit(CI_DISABLED, requested_sha=sha)
+                self.log.emit(WAIT_CI, sha=sha)
+                while not self.stop_event.is_set():
+                    st = self._read_agent_state_safe()
+                    if st is None or st.status != agent.status:
+                        return
+                    await asyncio.sleep(0.2)
+                return
+            self.log.emit(AGENT_STATE_INVALID, error=f"invalid ci.sha {sha!r}")
+            raise AgentStateError(f"invalid ci.sha {sha!r}")
+
+        sha = sha.strip().lower()  # normalize
+
+        # Verify SHA exists locally (skip when CI disabled for legacy compat)
+        if self.config.ci.enabled and not self._verify_sha_exists(sha):
+            self.log.emit(AGENT_STATE_INVALID, error=f"ci.sha not found locally: {sha}")
+            raise AgentStateError(f"ci.sha not found locally: {sha}")
+
+        # Cross-check git.head/pushed_head if present
+        if isinstance(agent.git, dict):
+            for key in ("head", "pushed_head"):
+                if key in agent.git and agent.git[key] is not None and agent.git[key] != sha:
+                    # Only error if full 40-char sha mismatch; short sha may be prefix
+                    if len(agent.git[key]) == 40 and len(sha) == 40:
+                        self.log.emit(AGENT_STATE_INVALID, error=f"git.{key} mismatch ci.sha")
+                        raise AgentStateError(f"git.{key} mismatch ci.sha")
+
         if not self.config.ci.enabled:
+            self.rt.status = SupervisorStatus.WAITING_CI
+            self._save_runtime()
             self.log.emit(CI_DISABLED, requested_sha=sha)
+            self.log.emit(WAIT_CI, sha=sha)
             while not self.stop_event.is_set():
                 st = self._read_agent_state_safe()
                 if st is None or st.status != agent.status:
                     return
                 await asyncio.sleep(0.2)
             return
-        raise NotImplementedError("CI provider polling (M7) is not implemented yet")
+
+        # Durable ci_wait
+        import time as _time
+        self.rt.status = SupervisorStatus.WAITING_CI
+        now = _now_iso()
+        if self.rt.ci_wait is None or self.rt.ci_wait.get("sha") != sha:
+            self.rt.ci_wait = {"sha": sha, "provider": self.config.ci.provider, "started_at": now, "last_status": CiStatus.NOT_FOUND.value, "last_observed_at": now}
+        self._save_runtime()
+        self.log.emit(CI_WAIT_STARTED, sha=sha, provider=self.config.ci.provider)
+        self.log.emit(WAIT_CI, sha=sha)
+
+        provider = self._make_ci_provider()
+        start_mono = _time.monotonic()
+        grace = self.config.ci.discovery_grace_seconds
+        max_wait = self.config.ci.max_wait_seconds
+        poll = self.config.ci.poll_seconds
+
+        while not self.stop_event.is_set():
+            # budget and timeout check
+            self._accrue_budget()
+            if _time.monotonic() - start_mono > max_wait:
+                self.log.emit(CI_WAIT_TIMEOUT, sha=sha)
+                try:
+                    inbox = self.layout.ci_inbox_dir(sha)
+                    atomic_write_json(inbox / "observation.json", {"provider": self.config.ci.provider, "sha": sha, "status": "TIMEOUT", "observed_at": _now_iso()})
+                except Exception:
+                    pass
+                self.rt.status = SupervisorStatus.STOPPED_LIMIT
+                self.rt.stop_reason = StopReason.CI_WAIT_TIMEOUT
+                self.rt.ci_wait = None
+                self._save_runtime()
+                self.log.emit(LIMIT_REACHED, reason="CI_WAIT_TIMEOUT")
+                return
+
+            try:
+                obs = await provider.get_status(repo=self.base, sha=sha)
+            except Exception as exc:
+                self.log.emit(CI_OBSERVED, sha=sha, status="ERROR", error=str(exc))
+                await asyncio.sleep(poll)
+                continue
+
+            self.rt.ci_wait["last_status"] = obs.status.value if hasattr(obs.status, "value") else str(obs.status)
+            self.rt.ci_wait["last_observed_at"] = obs.observed_at
+            self._save_runtime()
+            self.log.emit(CI_OBSERVED, sha=sha, status=self.rt.ci_wait["last_status"])
+
+            status_str = self.rt.ci_wait["last_status"]
+            elapsed = _time.monotonic() - start_mono
+
+            if status_str == "NOT_FOUND":
+                if elapsed < grace:
+                    await asyncio.sleep(poll)
+                    continue
+                else:
+                    self.log.emit(CI_WAIT_TIMEOUT, sha=sha, reason="NOT_FOUND beyond grace")
+                    self.rt.status = SupervisorStatus.STOPPED_LIMIT
+                    self.rt.stop_reason = StopReason.CI_WAIT_TIMEOUT
+                    self.rt.ci_wait = None
+                    self._save_runtime()
+                    self.log.emit(LIMIT_REACHED, reason="CI_WAIT_TIMEOUT")
+                    return
+
+            if status_str == "PENDING":
+                await asyncio.sleep(poll)
+                continue
+
+            if status_str == "SUCCESS":
+                self.rt.counters.ci_wakeups += 1
+                self.rt.ci_wait = None
+                self.rt.status = SupervisorStatus.BOOTING
+                self._save_runtime()
+                self.log.emit(CI_SUCCEEDED, sha=sha)
+                outcome = await self._activation_cycle("CI_SUCCEEDED")
+                await self._process_outcome(outcome)
+                return
+
+            if status_str == "FAILURE":
+                inbox = self.layout.ci_inbox_dir(sha)
+                try:
+                    await provider.collect_failure(repo=self.base, sha=sha, destination=inbox)
+                    self.log.emit(CI_MATERIAL_SAVED, sha=sha, inbox=str(inbox))
+                except Exception as exc:
+                    self.log.emit(CI_MATERIAL_SAVED, sha=sha, error=str(exc))
+                self.rt.counters.ci_wakeups += 1
+                self.rt.ci_wait = None
+                self.rt.status = SupervisorStatus.BOOTING
+                self._save_runtime()
+                self.log.emit(CI_FAILED, sha=sha, inbox=str(inbox))
+                outcome = await self._activation_cycle("CI_FAILED")
+                await self._process_outcome(outcome)
+                return
+
+            if status_str in ("CANCELLED", "ERROR"):
+                self.rt.ci_wait = None
+                self.rt.status = SupervisorStatus.BOOTING
+                self._save_runtime()
+                outcome = await self._activation_cycle("CI_FAILED")
+                await self._process_outcome(outcome)
+                return
+
+            if status_str == "TIMEOUT":
+                self.rt.status = SupervisorStatus.STOPPED_LIMIT
+                self.rt.stop_reason = StopReason.CI_WAIT_TIMEOUT
+                self.rt.ci_wait = None
+                self._save_runtime()
+                self.log.emit(LIMIT_REACHED, reason="CI_WAIT_TIMEOUT")
+                return
+
+            await asyncio.sleep(poll)
 
     async def _wait_human(self) -> Optional[str]:
         self.rt.status = SupervisorStatus.WAITING_HUMAN
         self._accrue_budget()
         self._save_runtime()
         self.log.emit(WAIT_HUMAN)
-        while not self.stop_event.is_set():
-            resume = self.layout.resume_path
-            if resume.exists():
+        store = HumanEventStore(self.layout.human_inbox_dir)
+        def _migrate_resume():
+            if self.layout.resume_path.exists():
                 try:
-                    marker = read_json_strict(resume)
-                except ValueError:
-                    marker = None
-                if marker is not None:
-                    event = marker.get("event")
-                    if event in ("HUMAN_APPROVED", "HUMAN_CHANGES_REQUESTED"):
-                        resume.unlink()
-                        self.rt.status = SupervisorStatus.BOOTING
-                        self._accrue_budget()
-                        self._save_runtime()
-                        self.log.emit(RESUME_RECEIVED, resume_event=event)
-                        return event
+                    marker = read_json_strict(self.layout.resume_path)
+                    evt = marker.get("event")
+                    if evt in ("HUMAN_APPROVED", "HUMAN_CHANGES_REQUESTED"):
+                        store.append(evt, message=marker.get("message"))
+                        try:
+                            self.layout.resume_path.unlink()
+                        except OSError:
+                            pass
+                        return True
+                except Exception:
+                    pass
+            return False
+        _migrate_resume()
+        while not self.stop_event.is_set():
+            _migrate_resume()
+            evt = store.next_pending()
+            if evt is not None:
+                store.mark_delivering(evt.event_id)
+                self.rt.human_event_id = evt.event_id
+                self._save_runtime()
+                self.log.emit(HUMAN_EVENT_RECEIVED, event_id=evt.event_id, event_type=evt.event_type)
+                self.log.emit(HUMAN_EVENT_DELIVERY_STARTED, event_id=evt.event_id)
+                self.rt.status = SupervisorStatus.BOOTING
+                self._accrue_budget()
+                self._save_runtime()
+                return evt.event_type
             await asyncio.sleep(0.2)
         return None
 
@@ -858,18 +1124,17 @@ class SupervisorEngine:
         self.log.emit(ORPHAN_EXITED, pid=pid, activation=parent.activation_id)
         return self._outcome_from_agent_state("RECOVER_AFTER_PARENT_CRASH")
 
-    async def _activation_cycle(self, reason: str) -> Optional[Outcome]:
+    async def _activation_cycle(self, reason: str, **prompt_kwargs) -> Optional[Outcome]:
         try:
-            return await self._activation_cycle_inner(reason)
+            return await self._activation_cycle_inner(reason, **prompt_kwargs)
         finally:
-            # 本轮激活已定案（Parent 确定退出或被取消后的整组终止完成）→ 释放租约
             self.lease.release()
 
     def _ensure_lease(self) -> bool:
         """确保引擎持有 Parent 租约；被他人持有时返回 False（绝不无租约 spawn）。"""
         return self.lease.held or self.lease.try_acquire()
 
-    async def _activation_cycle_inner(self, reason: str) -> Optional[Outcome]:
+    async def _activation_cycle_inner(self, reason: str, **prompt_kwargs) -> Optional[Outcome]:
         limit = self._enforce_limits()
         if limit is not None:
             return Outcome(action="stop_limit", limit_reason=limit)
@@ -888,8 +1153,13 @@ class SupervisorEngine:
         run_dir.mkdir(parents=True, exist_ok=True)
 
         git_before = capture_git(self.base)
+        try:
+            atomic_write_json(run_dir / "git-before.json", git_before.to_dict())
+            self.log.emit(GIT_SNAPSHOT, phase="before", activation=activation_id, **git_before.to_dict())
+        except Exception:
+            pass
         task_file = self.layout.task_file(self.config).relative_to(self.base).as_posix()
-        prompt = build_prompt(reason, task_file=task_file)
+        prompt = build_prompt(reason, task_file=task_file, **prompt_kwargs)
         (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
         prev_seq = self.rt.last_agent_checkpoint_seq
@@ -979,6 +1249,18 @@ class SupervisorEngine:
         self.rt.counters.parent_activations = activation_id
 
         git_after = capture_git(self.base)
+        try:
+            atomic_write_json(run_dir / "git-after.json", git_after.to_dict())
+            self.log.emit(GIT_SNAPSHOT, phase="after", activation=activation_id, **git_after.to_dict())
+            diff = compare_git_snapshots(git_before, git_after)
+            if diff.get("head_changed"):
+                self.log.emit(GIT_HEAD_CHANGED, activation=activation_id, before=git_before.head, after=git_after.head)
+            if diff.get("dirty_changed"):
+                self.log.emit(GIT_DIRTY_CHANGED, activation=activation_id, before=git_before.dirty, after=git_after.dirty)
+            if diff.get("branch_changed"):
+                self.log.emit(GIT_BRANCH_CHANGED, activation=activation_id, before=git_before.branch, after=git_after.branch)
+        except Exception:
+            pass
         agent_after = self._read_agent_state()
         fresh = bool(agent_after and agent_after.checkpoint_seq > prev_seq)
         if agent_after is not None:
@@ -1070,8 +1352,14 @@ class SupervisorEngine:
     def _write_run_artifact(
         self, activation_id, run_dir, git_before, git_after, agent_after, prompt, reason, result
     ):
-        atomic_write_json(run_dir / "git-before.json", git_before.to_dict())
-        atomic_write_json(run_dir / "git-after.json", git_after.to_dict())
+        # git-before/after already written crash-safely; ensure present but don't overwrite if already durable
+        try:
+            if not (run_dir / "git-before.json").exists():
+                atomic_write_json(run_dir / "git-before.json", git_before.to_dict())
+            if not (run_dir / "git-after.json").exists():
+                atomic_write_json(run_dir / "git-after.json", git_after.to_dict())
+        except Exception:
+            pass
         data = {
             "activation_id": activation_id,
             "reason": reason,

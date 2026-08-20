@@ -142,6 +142,23 @@ class Layout:
     def inbox_dir(self) -> Path:
         return self.supervisor_dir / "inbox"
 
+    def ci_inbox_dir(self, sha: str) -> Path:
+        return self.inbox_dir / f"ci-{sha}"
+
+    @property
+    def human_inbox_dir(self) -> Path:
+        return self.inbox_dir / "human"
+
+    def human_event_path(self, event_id: str) -> Path:
+        return self.human_inbox_dir / f"{event_id}.json"
+
+    @property
+    def git_startup_path(self) -> Path:
+        return self.supervisor_dir / "git-startup.json"
+
+    def ci_observation_path(self, sha: str) -> Path:
+        return self.ci_inbox_dir(sha) / "observation.json"
+
     def run_dir(self, activation_id: int) -> Path:
         return self.runs_dir / f"{_RUN_DIR_PREFIX}{activation_id:06d}"
 

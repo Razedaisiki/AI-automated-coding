@@ -288,11 +288,33 @@ Environment/infrastructure failures must not be disguised as application-code fi
 
 ---
 
+## Standard Delivery Loop (M9)
+
+The canonical Parent delivery sequence (freeze — do not reorder):
+
+```
+Read active task (as specified in Supervisor activation prompt)
+→ Read AGENTS.md if present
+→ Inspect repository (git status / diff / log / existing code / tests)
+→ Define acceptance criteria in .agent/PLAN.md
+→ Decompose into tasks (dependencies + ownership)
+→ Delegate suitable work to subagents (see Subagent Policy)
+→ Implement
+→ Parent inspect actual diff (see Parent Responsibilities)
+→ targeted tests → format → typecheck → lint → build → broader tests → doublecheck
+  (skip any tool not present; do not invent infrastructure)
+→ Fresh independent reviewer (see Reviewer section)
+→ git status/diff → commit → push
+→ WAIT_CI (only after local validation passed + commit exists + push completed + exact SHA known)
+```
+
+The Supervisor does **not** parse `.agent/PLAN.md`.
+
 ## Pull Request Policy
 
 When the task calls for a PR and tooling is available:
 
-* create or update the PR;
+* **Lookup existing PR first** — reuse/update the same PR for the same delivery lane. Never blind-create a second PR after a crash-recovery (idempotency).
 * include the task objective;
 * summarize important changes;
 * include validation performed;
@@ -305,6 +327,41 @@ The final automated state should normally be:
 Do **not** merge without explicit human approval.
 
 Respond to review feedback by returning to the normal implementation → review → validation loop.
+
+## PR Lifecycle & Idempotency (M10)
+
+Crash-recovery invariant: after `Supervisor` or `Parent` crash, the next `Parent` must `lookup existing PR` (by branch / head SHA / `gh pr view`) before creating a new one. A restarted `Parent` that blind-creates a second PR for the same branch is a defect.
+
+Supervisor only persists the mechanical reference:
+
+```json
+{"review": {"provider": "github", "pr_number": 123, "pr_url": "...", "head_sha": "..."}}
+```
+
+and schema-validates it (`pr_number:int`, `pr_url:str`, `head_sha:hex`). Supervisor never interprets PR content.
+
+## Review Feedback Loop (M10)
+
+```
+WAIT_CI → CI SUCCESS → Parent PR → WAIT_HUMAN
+→ HUMAN_CHANGES_REQUESTED → Parent repair → local validation → commit → push → WAIT_CI(new SHA)
+→ CI SUCCESS → update existing PR → WAIT_HUMAN
+→ HUMAN_APPROVED → Parent verify delivery (already merged / authorized to merge / wait human merge) → COMPLETED
+```
+
+* `CI success` and `human approval` do **not** automatically equal `COMPLETED`; only `Parent` may write `COMPLETED` after verifying acceptance criteria + CI + human gate.
+* Supports repeated `changes-requested` cycles; `HUMAN_APPROVED` paths: human already merged / Parent authorized to merge / still wait human merge — `Parent` decides, `Supervisor` never merges.
+
+## WAIT_CI Entry Contract (M9)
+
+`Parent` may write `WAIT_CI` only after:
+
+* local validation passed;
+* commit exists;
+* push completed;
+* exact `ci.sha` known and equals `git.head` and `git.pushed_head` (when those fields are present).
+
+`AgentState` validation enforces `ci.sha` hex format and `git.head == ci.sha` consistency; violation → `AgentStateError → STOPPED_ERROR`.
 
 ---
 

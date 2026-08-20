@@ -398,9 +398,33 @@ def cmd_resume(args) -> int:
         return 1
     layout = Layout(repo)
     layout.ensure_dirs()
-    atomic_write_json(layout.resume_path, {"event": args.event, "ts": now_iso()})
-    print("supervisor: resume marker written (%s)" % args.event)
-    return 0
+    try:
+        from .human_events import HumanEventStore
+        store = HumanEventStore(layout.human_inbox_dir)
+        msg = getattr(args, "message", None)
+        fpath = getattr(args, "file", None)
+        evt = store.append(args.event, message=msg, file=Path(fpath) if fpath else None)
+        # legacy compat: also write resume.json for older supervisors
+        try:
+            atomic_write_json(layout.resume_path, {"event": args.event, "ts": now_iso()})
+        except Exception:
+            pass
+        print(f"supervisor: human event {evt.event_id} written ({args.event})")
+        if evt.attachment_path:
+            print(f"  attachment: {evt.attachment_path}")
+        return 0
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        # fallback to legacy resume.json
+        try:
+            atomic_write_json(layout.resume_path, {"event": args.event, "ts": now_iso()})
+            print("supervisor: resume marker written (%s)" % args.event)
+            return 0
+        except Exception:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
 
 
 # ------------------------------------------------------------------ main
@@ -440,6 +464,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = sub.add_parser("resume", help="resume a WAIT_HUMAN state")
     p.add_argument("repo", nargs="?", default=".")
     p.add_argument("--event", required=True)
+    p.add_argument("--message", default=None, help="human feedback message (for CHANGES_REQUESTED)")
+    p.add_argument("--file", dest="file", default=None, help="path to feedback file to attach (copied into inbox)")
 
     args = parser.parse_args(argv)
 
