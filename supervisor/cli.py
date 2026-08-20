@@ -335,8 +335,10 @@ def cmd_status(args) -> int:
     )
     hg = getattr(rt, "human_gate", None)
     if isinstance(hg, dict) and hg.get("gate_id"):
-        print("human gate         : %s checkpoint_seq=%s pr=%s head=%s" % (
-            hg.get("gate_id"), hg.get("checkpoint_seq"), hg.get("pr_number"), hg.get("head_sha")))
+        print("human gate         : %s (checkpoint_seq=%s gate_id=%s)" % (
+            hg.get("gate_id"), hg.get("checkpoint_seq"), hg.get("gate_id")))
+        if hg.get("pr_number") or hg.get("head_sha"):
+            print("human gate ctx     : pr=%s head=%s" % (hg.get("pr_number"), hg.get("head_sha")))
     elif rt.status == SupervisorStatus.WAITING_HUMAN:
         print("human gate         : (pending)")
     if getattr(rt, "human_event_id", None):
@@ -412,29 +414,25 @@ def cmd_resume(args) -> int:
         msg = getattr(args, "message", None)
         fpath = getattr(args, "file", None)
         explicit_gate = getattr(args, "gate_id", None)
-        # Resolve gate binding: explicit --gate-id takes precedence, otherwise
-        # auto-bind to the current WAITING_HUMAN gate. Reject if not WAITING_HUMAN.
-        gate_id = explicit_gate
-        if gate_id is None:
-            rt = RuntimeStore(layout).load()
-            if rt is None or rt.status != SupervisorStatus.WAITING_HUMAN:
-                print("error: no active human gate (supervisor is not WAITING_HUMAN); "
-                      "retry after the next WAIT_HUMAN, or pass --gate-id explicitly", file=sys.stderr)
+        # Gate binding is mandatory: require WAITING_HUMAN with an active gate
+        # regardless of whether --gate-id is provided.
+        rt = RuntimeStore(layout).load()
+        if rt is None or rt.status != SupervisorStatus.WAITING_HUMAN:
+            print("error: no active human gate (supervisor is not WAITING_HUMAN); "
+                  "retry after the next WAIT_HUMAN", file=sys.stderr)
+            return 1
+        hg = getattr(rt, "human_gate", None)
+        cur_gate = hg.get("gate_id") if isinstance(hg, dict) else None
+        if not cur_gate:
+            print("error: active human gate has no gate_id; cannot bind", file=sys.stderr)
+            return 1
+        if explicit_gate is not None:
+            if explicit_gate != cur_gate:
+                print(f"error: gate mismatch: provided {explicit_gate!r} != current {cur_gate!r}", file=sys.stderr)
                 return 1
-            hg = getattr(rt, "human_gate", None)
-            if not isinstance(hg, dict) or not hg.get("gate_id"):
-                print("error: active human gate has no gate_id; cannot auto-bind", file=sys.stderr)
-                return 1
-            gate_id = hg["gate_id"]
+            gate_id = explicit_gate
         else:
-            # Validate explicit gate matches current active gate when WAITING_HUMAN
-            rt = RuntimeStore(layout).load()
-            if rt is not None and rt.status == SupervisorStatus.WAITING_HUMAN:
-                hg = getattr(rt, "human_gate", None)
-                cur = hg.get("gate_id") if isinstance(hg, dict) else None
-                if cur and gate_id != cur:
-                    print(f"error: gate mismatch: provided {gate_id!r} != current {cur!r}", file=sys.stderr)
-                    return 1
+            gate_id = cur_gate
         evt = store.append(args.event, message=msg, file=Path(fpath) if fpath else None, gate_id=gate_id)
         print(f"supervisor: human event {evt.event_id} written ({args.event})")
         print(f"  gate: {evt.gate_id}")

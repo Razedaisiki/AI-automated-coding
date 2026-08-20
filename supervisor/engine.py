@@ -41,6 +41,7 @@ from .events import (
     GIT_DIRTY_CHANGED,
     GIT_HEAD_CHANGED,
     GIT_SNAPSHOT,
+    HUMAN_EVENT_ACK_FAILED,
     HUMAN_EVENT_DELIVERED,
     HUMAN_EVENT_DELIVERY_STARTED,
     HUMAN_EVENT_RECEIVED,
@@ -170,6 +171,10 @@ class SupervisorEngine:
                 self.rt.last_agent_checkpoint_seq, existing_agent.checkpoint_seq
             )
             self._save_runtime()
+        # Reconcile dangling human delivery: if a DELIVERING event's gate
+        # already produced a new checkpoint, the Parent activation that handled
+        # it has durably advanced — close the gate without stale redelivery.
+        self._reconcile_human_delivery(existing_agent)
         self.log.emit(SUPERVISOR_STARTED, supervisor_pid=os.getpid())
 
         # 上次收尾在终止宽限期内崩溃（runtime 定格 STOPPING）→ 完成未被完成的 operator stop
@@ -263,10 +268,11 @@ class SupervisorEngine:
                             try:
                                 HumanEventStore(self.layout.human_inbox_dir).mark_delivered(pending_id)
                                 self.log.emit(HUMAN_EVENT_DELIVERED, event_id=pending_id)
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                self.log.emit(HUMAN_EVENT_ACK_FAILED, event_id=pending_id, error=str(exc))
+                                # Fail-closed: keep runtime state so reconciliation retries
+                                raise
                             self.rt.human_event_id = None
-                            # Gate is consumed with its event — clear for next WAIT_HUMAN
                             self.rt.human_gate = None
                             self._save_runtime()
                         result = await self._process_outcome(outcome)
@@ -531,6 +537,26 @@ class SupervisorEngine:
                 AGENT_STATE, status=state.status.value, checkpoint_seq=state.checkpoint_seq
             )
         return state
+
+    def _reconcile_human_delivery(self, agent: Optional[AgentState]) -> None:
+        pending_id = getattr(self.rt, "human_event_id", None)
+        gate = getattr(self.rt, "human_gate", None)
+        if not pending_id or not isinstance(gate, dict) or not gate.get("gate_id"):
+            return
+        gate_seq = gate.get("checkpoint_seq")
+        cur_seq = agent.checkpoint_seq if agent is not None else self.rt.last_agent_checkpoint_seq
+        # If the Parent activation that handled this event has durably advanced
+        # the checkpoint, the event is acknowledged even if ACK was lost.
+        if gate_seq is not None and cur_seq is not None and cur_seq > gate_seq:
+            try:
+                HumanEventStore(self.layout.human_inbox_dir).mark_delivered(pending_id)
+                self.log.emit(HUMAN_EVENT_DELIVERED, event_id=pending_id, gate_id=gate.get("gate_id"), reconciled=True)
+            except Exception as exc:
+                self.log.emit(HUMAN_EVENT_ACK_FAILED, event_id=pending_id, gate_id=gate.get("gate_id"), error=str(exc), reconciled=True)
+                return
+            self.rt.human_event_id = None
+            self.rt.human_gate = None
+            self._save_runtime()
 
     def _read_agent_state_safe(self) -> Optional[AgentState]:
         try:

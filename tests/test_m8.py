@@ -182,3 +182,132 @@ class TestWaitHumanEngine:
         e3 = store.append("HUMAN_APPROVED", gate_id=None)
         assert store.next_pending(gate_id=gate_b) is None
         assert store.next_pending(gate_id=None) is not None  # unbound visible only without gate filter
+
+    def test_crash_after_parent_before_ack_reconciles(self, tmp_repo):
+        # Parent handled event, wrote new checkpoint, Supervisor crash before ACK
+        # Reconcile should detect checkpoint advance and auto-ACK
+        cfg = default_config()
+        cfg.restart.backoff_seconds = [0.01]
+        layout = Layout(tmp_repo)
+        gate_id = "gate-crash-reconcile"
+        store = HumanEventStore(layout.human_inbox_dir)
+        e = store.append("HUMAN_APPROVED", gate_id=gate_id)
+        store.mark_delivering(e.event_id)
+        # Simulate runtime with gate at checkpoint_seq=10
+        from supervisor.storage import RuntimeStore, atomic_write_json, Layout as _L
+        from supervisor.engine import SupervisorEngine
+        from supervisor.models import AgentState
+        # Bootstrap runtime via engine so human_gate exists
+        runner = FakeParentRunner([__import__("conftest").Step(status="WAIT_HUMAN")], layout)
+        eng = SupervisorEngine(base_dir=tmp_repo, config=cfg, runner=runner)
+        import asyncio
+        from conftest import wait_until as _wu, event_names as _en
+        async def ctrl(en):
+            await _wu(lambda: "WAIT_HUMAN" in _en(en))
+            en.request_stop()
+        from conftest import run_engine as _re
+        _re(eng, ctrl)
+        rt = RuntimeStore(layout).load()
+        assert rt.human_gate is not None
+        real_gate = rt.human_gate["gate_id"]
+        real_seq = rt.human_gate.get("checkpoint_seq", 0)
+        # Replace with our DELIVERING event bound to real gate
+        store2 = HumanEventStore(layout.human_inbox_dir)
+        e2 = store2.append("HUMAN_APPROVED", gate_id=real_gate)
+        store2.mark_delivering(e2.event_id)
+        rt.human_event_id = e2.event_id
+        RuntimeStore(layout).save(rt)
+        # Advance agent checkpoint
+        adv = {
+            "schema_version": 1,
+            "status": "WAIT_HUMAN",
+            "checkpoint_seq": real_seq + 1,
+            "updated_at": "2026-08-18T07:00:00Z",
+        }
+        atomic_write_json(layout.agent_state_path, adv)
+        rt.last_agent_checkpoint_seq = real_seq + 1
+        RuntimeStore(layout).save(rt)
+        from supervisor.models import AgentState as _AS
+        eng2 = SupervisorEngine(base_dir=tmp_repo, config=cfg)
+        eng2.rt = RuntimeStore(layout).load()
+        eng2._reconcile_human_delivery(_AS.from_dict(adv))
+        assert store2.get(e2.event_id).status == "DELIVERED"
+        rt2 = RuntimeStore(layout).load()
+        assert rt2.human_event_id is None
+        assert rt2.human_gate is None
+
+    def test_ack_failure_is_fail_closed(self, tmp_repo, monkeypatch):
+        layout = Layout(tmp_repo)
+        store = HumanEventStore(layout.human_inbox_dir)
+        gate_id = "gate-ack-fail"
+        e = store.append("HUMAN_APPROVED", gate_id=gate_id)
+        store.mark_delivering(e.event_id)
+        # Simulate runtime holding this event
+        from supervisor.storage import RuntimeStore
+        from supervisor.engine import SupervisorEngine
+        from supervisor.config import default_config as _dc
+        cfg = _dc()
+        # Bootstrap WAITING_HUMAN gate
+        from conftest import FakeParentRunner, Step, run_engine, wait_until, event_names
+        runner = FakeParentRunner([Step(status="WAIT_HUMAN")], layout)
+        eng = SupervisorEngine(base_dir=tmp_repo, config=cfg, runner=runner)
+        async def ctrl(en):
+            await wait_until(lambda: "WAIT_HUMAN" in event_names(en))
+            en.request_stop()
+        run_engine(eng, ctrl)
+        rt = RuntimeStore(layout).load()
+        rt.human_event_id = e.event_id
+        rt.human_gate = {"gate_id": gate_id, "checkpoint_seq": 0}
+        rt.last_agent_checkpoint_seq = 0
+        RuntimeStore(layout).save(rt)
+        # mark_delivered failure must not clear runtime
+        def failing(self, eid):
+            raise OSError("disk fail")
+        monkeypatch.setattr(HumanEventStore, "mark_delivered", failing)
+        eng2 = SupervisorEngine(base_dir=tmp_repo, config=cfg)
+        eng2.rt = RuntimeStore(layout).load()
+        try:
+            HumanEventStore(layout.human_inbox_dir).mark_delivered(e.event_id)
+            assert False, "should have raised"
+        except OSError:
+            pass
+        rt2 = RuntimeStore(layout).load()
+        assert rt2.human_event_id == e.event_id
+        assert rt2.human_gate is not None
+        assert store.get(e.event_id).status == "DELIVERING"
+
+    def test_reconcile_does_not_ack_without_advance(self, tmp_repo):
+        layout = Layout(tmp_repo)
+        store = HumanEventStore(layout.human_inbox_dir)
+        gate_id = "gate-no-advance"
+        e = store.append("HUMAN_APPROVED", gate_id=gate_id)
+        store.mark_delivering(e.event_id)
+        from supervisor.storage import RuntimeStore, atomic_write_json
+        from supervisor.engine import SupervisorEngine
+        from supervisor.config import default_config as _dc
+        cfg = _dc()
+        # Create runtime with this gate at seq 5, agent still at 5
+        rt = RuntimeStore(layout).load()
+        if rt is None:
+            from conftest import FakeParentRunner, Step, run_engine, wait_until, event_names
+            runner = FakeParentRunner([Step(status="WAIT_HUMAN")], layout)
+            eng = SupervisorEngine(base_dir=tmp_repo, config=cfg, runner=runner)
+            async def ctrl(en):
+                await wait_until(lambda: "WAIT_HUMAN" in event_names(en))
+                en.request_stop()
+            run_engine(eng, ctrl)
+            rt = RuntimeStore(layout).load()
+        rt.human_event_id = e.event_id
+        rt.human_gate = {"gate_id": gate_id, "checkpoint_seq": 5}
+        rt.last_agent_checkpoint_seq = 5
+        RuntimeStore(layout).save(rt)
+        adv = {"schema_version": 1, "status": "WAIT_HUMAN", "checkpoint_seq": 5, "updated_at": "2026-08-18T07:00:00Z"}
+        atomic_write_json(layout.agent_state_path, adv)
+        from supervisor.models import AgentState
+        eng2 = SupervisorEngine(base_dir=tmp_repo, config=cfg)
+        eng2.rt = RuntimeStore(layout).load()
+        eng2._reconcile_human_delivery(AgentState.from_dict(adv))
+        # No advance → still DELIVERING, gate retained
+        assert store.get(e.event_id).status == "DELIVERING"
+        rt2 = RuntimeStore(layout).load()
+        assert rt2.human_event_id == e.event_id
