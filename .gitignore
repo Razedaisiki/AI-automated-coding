@@ -12,6 +12,7 @@ supervisor.toml
 # Agent runtime state — never tracked in the Supervisor source repo.
 # See docs/supervisor-protocol.md §0 (Source vs Runtime).
 .agent/
+.commandcode
 
 # Nested target repos used as fixtures
 hello_world/
