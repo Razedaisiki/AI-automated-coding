@@ -602,7 +602,15 @@ Inspect the repository (git status/diff/log) before continuing.
 
 ---
 
-## 19. 里程碑落点（M0–M5）
+## 19. M11 — Golden Path / Crash / Idempotency（PROVE THE SYSTEM）
+
+- Golden path（zero-network, fake target repo, bare remote, FakePrStore）：
+  `commit A→push A→WAIT_CI(A)→CI SUCCESS→create PR#1→WAIT_HUMAN G1→HUMAN_CHANGES_REQUESTED(G1)→repair commit B→push B→WAIT_CI(B)→CI SUCCESS→update same PR#1 head=B→WAIT_HUMAN G2→HUMAN_APPROVED(G2)→COMPLETED→STOPPED_SUCCESS`。Artifacts（runtime/events/runs/inbox/.agent/PR store/remote refs）一致；PR count==1；不依赖真实 token/GitHub。
+- Crash matrix：Parent (P1–P11) / Supervisor (S1–S20) / Human Gate (H1–H12) / CI (C1–C9) 关键点 kill -9 后 `restart` 仍满足全局 invariants：at most one Parent, no lost task/Git evidence/CI wait/Human event, same exact SHA, no stale approval crossing gate, no duplicate PR, no stale Parent writing, no incorrect COMPLETED, no corrupted runtime。`faults.FaultInjector`（Null/CrashAt）为 test-only hook，production 默认 no-op，不污染 Engine。
+- Idempotency：CI material, Human delivery/ACK reconciliation, PR create/update, push recovery, resume 均 `lookup/recover/reuse` 而非 blind create；external identity (SHA/event_id/gate_id/pr_number/head_sha/activation_id) crash 后复用。
+- Failure normalization：`HumanEventStore.mark_delivered → OSError` → `HUMAN_EVENT_ACK_FAILED` → `STOPPED_ERROR`，保留 `human_event_id/gate`（fail-closed，绝不继续自动化）。
+
+## 20. 里程碑落点（M0–M5）
 
 - 前 3 分钟 CI `NOT_FOUND` 不算失败（discovery grace）—— M7。
 - Token/cost 不做假硬限额（不按字符串长度乘价格）—— V2。
