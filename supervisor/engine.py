@@ -270,7 +270,10 @@ class SupervisorEngine:
                                 self.log.emit(HUMAN_EVENT_DELIVERED, event_id=pending_id)
                             except Exception as exc:
                                 self.log.emit(HUMAN_EVENT_ACK_FAILED, event_id=pending_id, error=str(exc))
-                                # Fail-closed: keep runtime state so reconciliation retries
+                                self.rt.status = SupervisorStatus.STOPPED_ERROR
+                                self.rt.stop_reason = StopReason.HUMAN_EVENT_ACK_FAILED
+                                self._save_runtime()
+                                self.log.emit(SUPERVISOR_STOPPED, status="STOPPED_ERROR", stop_reason="HUMAN_EVENT_ACK_FAILED")
                                 raise
                             self.rt.human_event_id = None
                             self.rt.human_gate = None
